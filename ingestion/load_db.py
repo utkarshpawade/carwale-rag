@@ -58,7 +58,8 @@ def load_embedding_source() -> dict:
         register_vector(sconn)
         rows = sconn.execute("SELECT content_hash, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall()
     print(f"reusing {len(rows)} embeddings from EMBED_SOURCE_URL", flush=True)
-    return {h: np.asarray(e, dtype=np.float32) for h, e in rows}
+    # pgvector >= 0.5 returns Vector objects; convert to float32 numpy arrays for re-insertion
+    return {h: np.asarray(e.to_numpy() if hasattr(e, "to_numpy") else e, dtype=np.float32) for h, e in rows}
 
 
 def main() -> None:
