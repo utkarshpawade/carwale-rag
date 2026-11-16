@@ -110,8 +110,8 @@ def powertrains(vs: list[dict]) -> list[dict]:
             "price": price_range(min(x["price"] for x in g if x.get("price")) if any(x.get("price") for x in g) else None,
                                  max((x["price"] or 0) for x in g)),
             "power": num(e.get("power_bhp"), "bhp"), "torque": num(e.get("torque_nm"), "Nm"),
-            "mileage": num(e.get("mileage_arai"), e.get("mileage_unit") or "kmpl"),
-            "mileage_real": num(e.get("mileage_owner"), e.get("mileage_unit") or "kmpl"),
+            "mileage": num(e.get("mileage_arai"), e.get("mileage_unit") or "kmpl", 2),
+            "mileage_real": num(e.get("mileage_owner"), e.get("mileage_unit") or "kmpl", 2),
             "tested": (f"city {num(e.get('mileage_city_tested'))} / highway {num(e.get('mileage_highway_tested'))}"
                        if e.get("mileage_city_tested") or e.get("mileage_highway_tested") else None),
             "range": num(e.get("range_km"), "km"), "battery": num(e.get("battery_kwh"), "kWh"),
@@ -193,8 +193,8 @@ def facts(m: dict, vs: list[dict], aspects: set[str], city: str | None = None, c
 def variants_table(vs: list[dict], limit: int = 14) -> str:
     lines = ["| Variant | Price | Fuel | Transmission | Mileage/Range | Notable features |", "|---|---|---|---|---|---|"]
     for v in vs[:limit]:
-        econ = num(v.get("mileage_arai"), v.get("mileage_unit") or "kmpl") or num(v.get("range_km"), "km") or \
-            (f"{num(v.get('mileage_effective'), v.get('mileage_unit') or 'kmpl')} ({v.get('mileage_basis')})" if v.get("mileage_effective") else "n/a")
+        econ = num(v.get("mileage_arai"), v.get("mileage_unit") or "kmpl", 2) or num(v.get("range_km"), "km") or \
+            (f"{num(v.get('mileage_effective'), v.get('mileage_unit') or 'kmpl', 2)} ({v.get('mileage_basis')})" if v.get("mileage_effective") else "n/a")
         lines.append(f"| {v['name']} | {inr(v.get('price'))} | {v.get('fuel_type')} | {v.get('transmission')} | {econ} | {feature_list(v.get('feature_tags'), 5)} |")
     if len(vs) > limit:
         lines.append(f"| … {len(vs) - limit} more variants | | | | | |")
@@ -222,7 +222,7 @@ def search_table(rows: list[dict]) -> str:
         if r.get("best_range"):
             econ = f"{num(r['best_range'], 'km')} range"
         elif r.get("best_mileage"):
-            econ = f"{num(r['best_mileage'], r.get('mileage_unit') or 'kmpl')} ({r.get('best_mileage_basis') or 'claimed'})"
+            econ = f"{num(r['best_mileage'], r.get('mileage_unit') or 'kmpl', 2)} ({r.get('best_mileage_basis') or 'claimed'})"
         else:
             econ = "not listed"
         safety = f"{r['ncap_rating']}★ {r.get('ncap_agency') or ''}".strip() if r.get("ncap_rating") else f"{r.get('max_airbags') or '?'} airbags"
