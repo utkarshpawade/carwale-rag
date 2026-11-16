@@ -1,0 +1,17 @@
+# Render Blueprint: New > Blueprint > pick this repo. Secrets are entered in the dashboard (sync: false).
+services:
+  - type: web
+    name: carwale-rag-api
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    healthCheckPath: /api/health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        value: http://localhost:5173

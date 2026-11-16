@@ -1,0 +1,439 @@
+"""Per-turn RAG pipeline (exactly 2 LLM calls on the normal path):
+
+  memory -> PLAN (LLM #1, strict JSON) -> resolve cars -> route -> retrieve (SQL and/or hybrid search)
+         -> token-budgeted context -> ANSWER (LLM #2, streamed) -> persist history + working state
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, AsyncIterator
+
+from ..config import Settings
+from ..embeddings import Embedder
+from ..llm.client import CallInfo, LLMClient, LLMUnavailable
+from ..llm.prompts import ANSWER_SYSTEM, CHITCHAT_SYSTEM, PLANNER_SYSTEM, SUMMARY_SYSTEM
+from ..memory import store
+from ..memory.store import ConvState
+from . import car_search, specs
+from .context import build_context
+from .entities import CarResolver, norm
+from .followups import suggest
+from .hybrid_search import hybrid_search
+from .schemas import PLAN_SCHEMA, Filters, QueryPlan, empty_filters, simple_plan
+
+SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
+                       r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
+CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
+INTENT_SECTIONS = {
+    "spec": ["specs", "mileage", "overview", "faq", "trim", "features"],
+    "price": ["variants", "city_prices", "faq", "overview", "trim"],
+    "feature_check": ["features", "trim", "faq", "safety"],
+    "safety": ["safety", "expert_opinion", "faq", "overview"],
+    "service": ["service", "owner_reviews", "faq", "pros_cons"],
+    "review": ["pros_cons", "expert_opinion", "expert_review", "owner_reviews", "overview"],
+    "variant_advice": ["trim", "variants", "pros_cons", "features"],
+    "compare": ["pros_cons", "expert_opinion", "overview", "mileage", "safety"],
+}
+DEFAULT_ASPECTS = {"spec": {"specs"}, "price": {"price", "variants"}, "feature_check": {"features", "variants"},
+                   "safety": {"safety"}, "service": {"service", "reviews"}, "review": {"reviews"},
+                   "variant_advice": {"variants", "features", "price"}}
+ASPECT_SECTIONS = {"mileage": ["mileage"], "safety": ["safety"], "service": ["service"], "features": ["features"],
+                   "reviews": ["owner_reviews", "pros_cons"], "on_road_price": ["city_prices"],
+                   "price": ["variants", "city_prices"], "variants": ["trim", "variants"], "dimensions": ["specs"],
+                   "performance": ["specs", "expert_opinion"], "comfort": ["expert_opinion", "features"]}
+
+
+@dataclass
+class Event:
+    type: str
+    data: Any
+
+
+class Timer:
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.marks: dict[str, int] = {}
+
+    def mark(self, name: str) -> None:
+        self.marks[name] = int((time.perf_counter() - self.t0) * 1000)
+
+
+def merge_filters(old: dict, new: Filters) -> Filters:
+    base = Filters.model_validate({**empty_filters().model_dump(), **(old or {})})
+    upd = {k: v for k, v in new.model_dump().items() if v not in (None, [], "launched")}
+    return base.model_copy(update=upd)
+
+
+class Pipeline:
+    def __init__(self, settings: Settings, llm: LLMClient, resolver: CarResolver, embedder: Embedder, stats: dict):
+        self.s, self.llm, self.resolver, self.embedder, self.stats = settings, llm, resolver, embedder, stats
+        self._bg: set[asyncio.Task] = set()
+
+    # ------------------------------------------------------------------------------------------ planner
+    def _planner_messages(self, message: str, history: list[dict], st: ConvState) -> list[dict]:
+        lines = []
+        if st.summary:
+            lines.append(f"Summary of earlier conversation: {st.summary}")
+        if history:
+            lines.append("Recent turns:")
+            for h in history:
+                txt = h["content"] if h["role"] == "user" else (h["meta"].get("digest") or h["content"])
+                lines.append(f"{'User' if h['role'] == 'user' else 'Assistant'}: {txt[:350]}")
+        if st.active_cars:
+            lines.append("Active cars from the last answer (numbered): " +
+                         " ".join(f"{i}. {self.resolver.name(m)}" for i, m in enumerate(st.active_cars, 1)))
+        if st.focus_car:
+            lines.append(f"Focus car: {self.resolver.name(st.focus_car)}")
+        f = {k: v for k, v in (st.filters or {}).items() if v not in (None, [], "launched")}
+        if f:
+            lines.append("Current search filters: " + json.dumps(f))
+        if st.prefs:
+            lines.append("User preferences: " + json.dumps(st.prefs))
+        ctx = "CONTEXT\n" + ("\n".join(lines) if lines else "(new conversation)")
+        return [{"role": "system", "content": PLANNER_SYSTEM},
+                {"role": "user", "content": f"{ctx}\n\nLATEST USER MESSAGE: {message}"}]
+
+    # ------------------------------------------------------------------------------------------ resolve
+    def _targets(self, plan: QueryPlan, st: ConvState) -> tuple[list[str], list[dict], list[str], list[str]]:
+        ids: list[str] = []
+        if plan.refers_to == "focus" and st.focus_car:
+            ids.append(st.focus_car)
+        elif plan.refers_to == "all":
+            ids += st.active_cars
+        elif plan.refers_to == "indices":
+            ids += [st.active_cars[i - 1] for i in plan.active_indices if 1 <= i <= len(st.active_cars)]
+        resolved, unresolved, notes = [], [], []
+        for car in plan.cars:
+            res = self.resolver.resolve(car.mention)
+            if not res:
+                unresolved.append(car.mention)
+                continue
+            top = res[0]
+            alts = [a for a in top.ambiguous if self.resolver.models[a].get("status") == "launched"][:1]
+            resolved.append({"mention": car.mention, "model_id": top.model_id, "name": top.full_name,
+                             "score": top.score, "ambiguous": alts})
+            ids.append(top.model_id)
+            if alts and plan.intent in CAR_INTENTS:
+                ids += alts
+                notes.append(f"'{car.mention}' matches more than one model ({', '.join(self.resolver.name(x) for x in [top.model_id] + alts)}); covering each.")
+        if not ids and plan.intent in CAR_INTENTS and st.focus_car and not unresolved and not plan.cars:
+            ids.append(st.focus_car)  # planner forgot refers_to
+        return list(dict.fromkeys(ids))[:4], resolved, unresolved, notes
+
+    # ------------------------------------------------------------------------------------------ main turn
+    async def run(self, conv_id: str, user_id: str, message: str, dry_run: bool = False) -> AsyncIterator[Event]:
+        """dry_run=True stops after retrieval (used by the eval harness to save LLM tokens)."""
+        timer = Timer()
+        st = await store.load_state(conv_id)
+        history = await store.recent_messages(conv_id, self.s.history_turns * 2)
+        await store.ensure_conversation(conv_id, user_id, message)
+        await store.add_message(conv_id, "user", message, {})
+        yield Event("status", {"text": "Understanding your question…"})
+
+        cache_key = None
+        if not history and not SMALLTALK.match(message) and not dry_run:
+            cache_key = hashlib.sha1(f"v1|{norm(message)}".encode()).hexdigest()
+            cached = await store.cache_get(cache_key)
+            if cached:
+                async for ev in self._replay(conv_id, st, cached, timer):
+                    yield ev
+                return
+
+        # ---- 1. plan
+        planner_info: CallInfo | None = None
+        if SMALLTALK.match(message):
+            plan = simple_plan(message, "chitchat")
+        else:
+            try:
+                plan, planner_info = await self.llm.json("planner", self._planner_messages(message, history, st),
+                                                         QueryPlan, PLAN_SCHEMA, max_tokens=1000)
+            except LLMUnavailable as e:
+                yield Event("error", {"message": self._busy(e)})
+                return
+        timer.mark("plan")
+
+        # ---- 2. resolve
+        target_ids, resolved, unresolved, notes = self._targets(plan, st)
+        trace: dict[str, Any] = {
+            "rewritten_query": plan.standalone_query, "intent": plan.intent, "plan": plan.model_dump(),
+            "resolved_cars": resolved, "unresolved": unresolved, "notes": list(notes),
+            "memory": {"summary_used": bool(st.summary), "history_messages": len(history),
+                       "active_cars_before": [self.resolver.name(m) for m in st.active_cars],
+                       "focus_before": self.resolver.name(st.focus_car) if st.focus_car else None,
+                       "filters_before": st.filters},
+        }
+
+        # ---- 3. chit-chat / clarify short paths
+        if plan.intent in ("chitchat", "out_of_scope"):
+            trace["route"] = plan.intent
+            async for ev in self._simple_answer(conv_id, st, message, history, plan, trace, timer, planner_info):
+                yield ev
+            return
+        if plan.clarify and not target_ids and plan.intent in CAR_INTENTS:
+            trace["route"] = "clarify"
+            async for ev in self._emit_fixed(conv_id, st, plan.clarify, plan, trace, timer, planner_info):
+                yield ev
+            return
+
+        # ---- 4. route + retrieve
+        qvec = await asyncio.to_thread(self.embedder.embed_query, plan.standalone_query)
+        blocks: list[str] = [f"Note: {n}" for n in notes]
+        chunks: list[dict] = []
+        cards: list[dict] = []
+        new_active, new_focus, new_filters = st.active_cars, st.focus_car, st.filters
+        rivals: list[str] = []
+        search_like = plan.intent == "recommend" or (plan.intent not in CAR_INTENTS | {"general"} and plan.filter_mode != "none")
+        restrict = target_ids if plan.refers_to in ("all", "indices") and target_ids and plan.intent == "recommend" else None
+
+        if search_like:
+            f = merge_filters(st.filters, plan.filters) if (plan.filter_mode == "refine" or restrict) else plan.filters
+            brand_slugs = [b for b in (self.resolver.brand_slug(x) for x in f.brands) if b]
+            if f.status == "upcoming":
+                yield Event("status", {"text": "Looking up upcoming launches…"})
+                rows = await car_search.search_upcoming(f, brand_slugs)
+                trace["route"] = "upcoming_search"
+                blocks.append("Upcoming cars (prices are expected):\n" + "\n".join(
+                    f"- {r['full_name']}: {specs.price_range(r.get('price_min'), r.get('price_max'))} expected, "
+                    f"launch {r.get('launched_on') or 'TBA'}, {r.get('body_type_raw') or ''}" for r in rows))
+                desc, relax = [], []
+            else:
+                yield Event("status", {"text": f"Searching {self.stats.get('variants', 0):,} variants across "
+                                               f"{self.stats.get('models', 0)} models…"})
+                rows, desc, relax = await car_search.search_cars(f, plan.sort_by, plan.prefer_tags, brand_slugs, restrict,
+                                                                 limit=8)
+                if not rows and restrict:
+                    rows, desc, relax = await car_search.search_cars(empty_filters(), plan.sort_by, plan.prefer_tags, [], restrict)
+                trace["route"] = "structured_search"
+                blocks.append(f"Search: {'; '.join(desc) or 'no filters'}; sorted by {plan.sort_by}."
+                              + (f" Relaxation: {'; '.join(relax)}." if relax else "")
+                              + f" {len(rows)} matching models shown.")
+                if rows:
+                    blocks.append(specs.search_table(rows))
+                else:
+                    blocks.append("No cars in the CarWale catalog match these filters.")
+            trace["sql_filters"], trace["relaxed"] = desc, relax
+            ids = [r["id"] for r in rows]
+            cards = [specs.card(r) for r in rows]
+            if ids:
+                chunks = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=ids,
+                                             sections=["overview", "pros_cons", "expert_opinion", "highlights"],
+                                             k=7, per_model_cap=2)
+                new_active, new_focus = ids, ids[0]
+            new_filters = f.model_dump()
+        elif target_ids:
+            yield Event("status", {"text": "Reading " + ", ".join(self.resolver.name(i) for i in target_ids) + " data…"})
+            models = await specs.load_models(target_ids)
+            variants = await specs.load_variants(target_ids)
+            aspects = set(plan.aspects) or DEFAULT_ASPECTS.get(plan.intent, set())
+            compare = plan.intent == "compare" or len(target_ids) > 1
+            hints = {self.resolver.resolve(c.mention)[0].model_id: c for c in plan.cars if self.resolver.resolve(c.mention)}
+            all_facts, names = [], []
+            for mid in target_ids:
+                m = models.get(mid)
+                if not m:
+                    continue
+                h = hints.get(mid)
+                vs, vnotes = specs.filter_variants(variants.get(mid, []), h.fuel_hint if h else None,
+                                                   h.transmission_hint if h else None, h.variant_hint if h else None)
+                fs = specs.facts(m, vs, aspects, plan.city or st.prefs.get("city"), compare=compare)
+                if vnotes:
+                    fs["Note"] = "; ".join(vnotes)
+                all_facts.append(fs)
+                names.append(m["full_name"])
+                cards.append(specs.card(m))
+                if not compare:
+                    blocks.append(specs.facts_block(m["full_name"], m["url"], fs))
+                    if plan.intent in ("feature_check", "variant_advice", "price") or "variants" in aspects:
+                        blocks.append(f"Variants of {m['full_name']}:\n" + specs.variants_table(vs))
+                rivals += [self.resolver.name(x) for x in ((m.get("data") or {}).get("similar") or [])[:2]]
+            if compare and all_facts:
+                blocks.append("Comparison:\n" + specs.compare_table(names, all_facts))
+            sections = list(dict.fromkeys(INTENT_SECTIONS.get(plan.intent, []) +
+                                          [s for a in aspects for s in ASPECT_SECTIONS.get(a, [])]))
+            chunks = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=target_ids,
+                                         sections=sections or None, k=8 if compare else 6,
+                                         per_model_cap=3 if compare else None)
+            trace["route"] = "compare" if compare else "car_details"
+            trace["aspects"] = sorted(aspects)
+            if not set(target_ids) <= set(st.active_cars):
+                new_active = target_ids
+            new_focus = target_ids[0]
+        else:
+            trace["route"] = "semantic_search"
+            if unresolved:
+                blocks.append(f"Not found in CarWale's India new-car catalog: {', '.join(unresolved)}. "
+                              "Tell the user it isn't listed and suggest similar cars if the sources mention any.")
+            gl = await hybrid_search(qvec, plan.standalone_query, plan.keywords, sections=["glossary"], k=2) \
+                if plan.intent == "general" else []
+            rest = await hybrid_search(qvec, plan.standalone_query, plan.keywords, k=6)
+            seen = {c["id"] for c in gl}
+            chunks = gl + [c for c in rest if c["id"] not in seen][: 6 - len(gl)]
+        timer.mark("retrieve")
+
+        context, sources = build_context(blocks, chunks, self.s.context_token_budget)
+        trace["retrieved"] = sources
+        trace["context_tokens_est"] = len(context) // 4
+        if plan.city:
+            st.prefs["city"] = plan.city
+        yield Event("trace", trace)
+        if cards:
+            yield Event("cars", {"cars": cards[:8]})
+        yield Event("sources", {"sources": sources})  # before tokens, so the UI can link [n] citations live
+        if dry_run:
+            names = [c["name"] for c in cards] if cards else [self.resolver.name(i) for i in target_ids]
+            await store.add_message(conv_id, "assistant", "[dry run]", {"digest": f"[cars: {', '.join(names[:6])}]", "trace": trace})
+            await store.save_state(conv_id, ConvState(summary=st.summary, summarized_upto=st.summarized_upto,
+                                                      active_cars=new_active or [], focus_car=new_focus,
+                                                      filters=new_filters or {}, prefs=st.prefs))
+            trace["llm"] = [planner_info.as_dict()] if planner_info else []
+            yield Event("done", {"dry_run": True, "trace": trace})
+            return
+        yield Event("status", {"text": "Writing the answer…"})
+
+        # ---- 5. generate
+        msgs = [{"role": "system", "content": ANSWER_SYSTEM}]
+        if st.summary:
+            msgs.append({"role": "system", "content": f"Conversation summary so far: {st.summary}"})
+        for h in history[-4:]:
+            content = h["content"] if h["role"] == "user" else (h["meta"].get("digest") or h["content"])[:600]
+            msgs.append({"role": h["role"], "content": content})
+        q = plan.standalone_query + (f"\n(User's exact words: {message})" if norm(message) != norm(plan.standalone_query) else "")
+        msgs.append({"role": "user", "content": f"{context}\n\n## QUESTION\n{q}"})
+        answer_info = CallInfo("answer")
+        parts: list[str] = []
+        try:
+            async for delta in self.llm.stream("answer", msgs, self.s.answer_max_tokens, answer_info):
+                if not parts:
+                    timer.mark("first_token")
+                parts.append(delta)
+                yield Event("token", {"text": delta})
+        except LLMUnavailable as e:
+            if not parts:
+                yield Event("error", {"message": self._busy(e)})
+                return
+            parts.append("\n\n_(answer cut short: the AI service is busy)_")
+        answer = "".join(parts).strip()
+        timer.mark("total")
+
+        names = [c["name"] for c in cards] if cards else [self.resolver.name(i) for i in target_ids]
+        fups = suggest(plan.intent, names, rivals, bool(plan.filters.transmission))
+        trace["timings_ms"] = timer.marks
+        trace["llm"] = [i.as_dict() for i in (planner_info, answer_info) if i]
+        yield Event("trace", trace)  # final trace with timings + token usage
+        yield Event("followups", {"followups": fups})
+
+        # ---- 6. persist memory
+        new_state = ConvState(summary=st.summary, summarized_upto=st.summarized_upto, active_cars=new_active or [],
+                              focus_car=new_focus, filters=new_filters or {}, prefs=st.prefs)
+        if plan.filters.price_max:
+            new_state.prefs["budget_max"] = plan.filters.price_max
+        digest = self._digest(answer, names)
+        meta = {"plan": plan.model_dump(), "sources": sources, "cars": cards[:6], "followups": fups, "trace": trace,
+                "digest": digest}
+        msg_id = await store.add_message(conv_id, "assistant", answer, meta)
+        await store.save_state(conv_id, new_state)
+        if cache_key and plan.intent not in ("chitchat", "out_of_scope") and not plan.city:
+            await store.cache_put(cache_key, {"answer": answer, "cars": cards[:6], "sources": sources, "followups": fups,
+                                              "trace": trace, "active_cars": new_state.active_cars,
+                                              "focus_car": new_state.focus_car, "filters": new_state.filters,
+                                              "digest": digest, "plan": plan.model_dump()})
+        self._spawn(self._maybe_summarize(conv_id))
+        yield Event("done", {"message_id": msg_id, "conversation_id": conv_id, "timings_ms": timer.marks,
+                             "models": [i.model for i in (planner_info, answer_info) if i and i.model]})
+
+    # ------------------------------------------------------------------------------------------ helpers
+    @staticmethod
+    def _digest(answer: str, names: list[str]) -> str:
+        text = re.sub(r"\s+", " ", re.sub(r"[|#*_`>-]+", " ", answer)).strip()
+        return (f"[cars: {', '.join(names[:6])}] " if names else "") + text[:420]
+
+    @staticmethod
+    def _busy(e: LLMUnavailable) -> str:
+        if getattr(e, "auth", False):
+            return "The AI service is not configured correctly (Groq API key missing or invalid)."
+        wait = f" in about {int(e.retry_after)} seconds" if e.retry_after else " in a moment"
+        return f"The AI service is at its free-tier limit right now. Please try again{wait}."
+
+    async def _simple_answer(self, conv_id, st, message, history, plan, trace, timer, planner_info):
+        msgs = [{"role": "system", "content": CHITCHAT_SYSTEM}]
+        for h in history[-2:]:
+            msgs.append({"role": h["role"], "content": (h["meta"].get("digest") or h["content"])[:400]})
+        msgs.append({"role": "user", "content": message})
+        info = CallInfo("summary")
+        parts = []
+        try:
+            async for d in self.llm.stream("summary", msgs, 200, info):
+                parts.append(d)
+                yield Event("token", {"text": d})
+        except LLMUnavailable:
+            fallback = "Hi! I'm CarWale Assistant. Ask me about car prices, mileage, safety, features or comparisons."
+            parts = [fallback]
+            yield Event("token", {"text": fallback})
+        timer.mark("total")
+        trace["timings_ms"] = timer.marks
+        trace["llm"] = [i.as_dict() for i in (planner_info, info) if i]
+        yield Event("trace", trace)
+        fups = suggest("chitchat", [], [], False)
+        yield Event("followups", {"followups": fups})
+        msg_id = await store.add_message(conv_id, "assistant", "".join(parts), {"plan": plan.model_dump(), "trace": trace,
+                                                                             "followups": fups, "digest": "".join(parts)[:200]})
+        yield Event("done", {"message_id": msg_id, "conversation_id": conv_id, "timings_ms": timer.marks})
+
+    async def _emit_fixed(self, conv_id, st, text, plan, trace, timer, planner_info):
+        yield Event("token", {"text": text})
+        timer.mark("total")
+        trace["timings_ms"] = timer.marks
+        trace["llm"] = [planner_info.as_dict()] if planner_info else []
+        yield Event("trace", trace)
+        msg_id = await store.add_message(conv_id, "assistant", text, {"plan": plan.model_dump(), "trace": trace, "digest": text})
+        yield Event("done", {"message_id": msg_id, "conversation_id": conv_id, "timings_ms": timer.marks})
+
+    async def _replay(self, conv_id, st, cached, timer):
+        trace = dict(cached.get("trace") or {})
+        trace["cache"] = "hit (answer served from cache, 0 LLM tokens)"
+        yield Event("trace", trace)
+        if cached.get("cars"):
+            yield Event("cars", {"cars": cached["cars"]})
+        text = cached["answer"]
+        for i in range(0, len(text), 24):
+            yield Event("token", {"text": text[i:i + 24]})
+            await asyncio.sleep(0.008)
+        timer.mark("total")
+        yield Event("sources", {"sources": cached.get("sources") or []})
+        yield Event("followups", {"followups": cached.get("followups") or []})
+        msg_id = await store.add_message(conv_id, "assistant", text, {"plan": cached.get("plan"), "sources": cached.get("sources"),
+                                                                     "cars": cached.get("cars"), "followups": cached.get("followups"),
+                                                                     "trace": trace, "digest": cached.get("digest")})
+        await store.save_state(conv_id, ConvState(summary=st.summary, summarized_upto=st.summarized_upto,
+                                                  active_cars=cached.get("active_cars") or [], focus_car=cached.get("focus_car"),
+                                                  filters=cached.get("filters") or {}, prefs=st.prefs))
+        yield Event("done", {"message_id": msg_id, "conversation_id": conv_id, "timings_ms": timer.marks, "cached": True})
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _maybe_summarize(self, conv_id: str) -> None:
+        """Rolling summary: fold messages older than the short-term buffer into conversation_state.summary."""
+        try:
+            st = await store.load_state(conv_id)
+            msgs = await store.messages_after(conv_id, st.summarized_upto)
+            keep = self.s.history_turns * 2
+            older = msgs[:-keep] if len(msgs) > keep else []
+            if len(older) < self.s.summarize_after_messages:
+                return
+            transcript = "\n".join(f"{m['role']}: {m['content'][:500]}" for m in older)
+            prompt = (f"Existing summary: {st.summary or '(none)'}\n\nNew conversation part:\n{transcript}")
+            text, _ = await self.llm.text("summary", [{"role": "system", "content": SUMMARY_SYSTEM},
+                                                      {"role": "user", "content": prompt}], 220)
+            st2 = await store.load_state(conv_id)
+            st2.summary, st2.summarized_upto = text.strip(), older[-1]["id"]
+            await store.save_state(conv_id, st2)
+        except Exception:
+            pass  # summarisation is best-effort; the short-term buffer still works

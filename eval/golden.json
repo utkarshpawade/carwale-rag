@@ -1,0 +1,37 @@
+{
+  "single_turn": [
+    {"q": "smart hybrid cars under 30 lakhs", "intent": ["recommend"], "filters": {"price_max": 3000000}, "fuel_any": ["Hybrid"], "route": "structured_search", "cars_any": ["maruti-suzuki/grand-vitara", "toyota/hyryder", "toyota/innova-hycross", "honda/city", "maruti-suzuki/victoris", "renault/duster"]},
+    {"q": "What is the mileage of the Toyota Innova Hycross hybrid?", "intent": ["spec"], "targets": ["toyota/innova-hycross"], "sections_any": ["mileage", "specs", "trim"], "answer_has": ["23.24"]},
+    {"q": "Creta vs Seltos", "intent": ["compare"], "targets": ["hyundai/creta", "kia/seltos"], "route": "compare"},
+    {"q": "Is the Tata Punch safe?", "intent": ["safety"], "targets": ["tata/punch"], "sections_any": ["safety"]},
+    {"q": "Does the Hyundai Venue have a sunroof?", "intent": ["feature_check"], "targets": ["hyundai/venue"]},
+    {"q": "service cost of maruti brezza", "intent": ["service"], "targets": ["maruti-suzuki/brezza"], "sections_any": ["service"]},
+    {"q": "What do owners say about the MG Hector?", "intent": ["review"], "targets": ["mg/hector"], "sections_any": ["owner_reviews", "pros_cons"]},
+    {"q": "Which Kia Sonet variant is value for money?", "intent": ["variant_advice"], "targets": ["kia/sonet"]},
+    {"q": "Safest SUVs under 15 lakh", "intent": ["recommend"], "filters": {"price_max": 1500000}, "body_any": ["SUV"], "route": "structured_search"},
+    {"q": "best mileage petrol automatic cars under 10 lakh", "intent": ["recommend"], "filters": {"price_max": 1000000, "transmission": "Automatic"}, "sort": "mileage"},
+    {"q": "7 seater cars with sunroof under 20 lakh", "intent": ["recommend"], "filters": {"price_max": 2000000, "seats_min": 7}},
+    {"q": "electric cars with more than 400 km range", "intent": ["recommend"], "fuel_any": ["Electric"]},
+    {"q": "What is the difference between a mild hybrid and a strong hybrid?", "intent": ["general"], "route": "semantic_search", "sections_any": ["glossary"]},
+    {"q": "fortuneer price in delhi", "intent": ["price"], "targets": ["toyota/fortuner"]},
+    {"q": "brezza ka mileage kitna hai", "intent": ["spec"], "targets": ["maruti-suzuki/brezza"]},
+    {"q": "xuv700 boot space", "intent": ["spec"], "targets": ["mahindra/xuv-7xo"]},
+    {"q": "upcoming SUVs launching soon", "intent": ["recommend"], "route": "upcoming_search"},
+    {"q": "who won the cricket world cup?", "intent": ["out_of_scope"]},
+    {"q": "hi", "intent": ["chitchat"]},
+    {"q": "Nexon EV range and charging time", "intent": ["spec"], "targets": ["tata/nexon-ev"]}
+  ],
+  "multi_turn": [
+    {"name": "hybrid shopping", "turns": [
+      {"q": "smart hybrid cars under 30 lakhs", "intent": ["recommend"]},
+      {"q": "which one has the best mileage?", "intent": ["recommend", "spec", "compare"], "refers": ["all", "indices", "focus"]},
+      {"q": "what about its safety?", "intent": ["safety"], "refers": ["focus", "indices"]},
+      {"q": "only 7 seaters", "intent": ["recommend"], "filters": {"seats_min": 7}, "filter_mode": "refine"}
+    ]},
+    {"name": "compare follow-ups", "turns": [
+      {"q": "Compare Creta and Seltos", "intent": ["compare"], "targets": ["hyundai/creta", "kia/seltos"]},
+      {"q": "which is cheaper?", "intent": ["compare", "price", "recommend"], "targets_any": ["hyundai/creta", "kia/seltos"]},
+      {"q": "does the second one get ventilated seats?", "intent": ["feature_check"], "targets": ["kia/seltos"]}
+    ]}
+  ]
+}
