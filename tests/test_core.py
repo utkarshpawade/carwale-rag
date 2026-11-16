@@ -78,6 +78,20 @@ def test_resolver_ambiguous_and_brand_only(resolver):
     assert resolver.resolve("tata") == []
 
 
+@pytest.mark.parametrize("mention", ["EV version", "the diesel one", "its automatic variant", "top variant"])
+def test_generic_mentions_never_match_a_car(resolver, mention):
+    # regression: WRatio matched "EV version" to Maserati GranCabrio Folgore EV
+    assert resolver.resolve(mention) == []
+
+
+@pytest.mark.parametrize("mention,expected", [
+    ("maruti grand vitara strong hybrid", "maruti-suzuki/grand-vitara"), ("toyota hycross", "toyota/innova-hycross"),
+    ("tata punch ev", "tata/punch-ev"), ("i20 n line", "hyundai/i20-n-line"), ("kia carens clavis ev", "kia/carens-clavis-ev"),
+])
+def test_resolver_longer_mentions(resolver, mention, expected):
+    assert resolver.resolve(mention)[0].model_id == expected
+
+
 # ---------------------------------------------------------------- SQL safety + filters
 def test_where_is_parameterized_and_whitelisted():
     f = empty_filters()

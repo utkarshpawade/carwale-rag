@@ -29,6 +29,15 @@ MANUAL_ALIASES = {
     "g wagon": "mercedes-benz/g-class", "g wagen": "mercedes-benz/g-class",
 }
 FILLER = {"new", "the", "car", "cars", "model", "latest", "2025", "2026", "2027", "suv", "india", "price", "a"}
+# a mention made only of these words is a modifier of an earlier car ("EV version", "the diesel one"), not a car name
+GENERIC_MENTION = FILLER | {"ev", "electric", "version", "variant", "variants", "petrol", "diesel", "cng", "hybrid",
+                            "automatic", "manual", "amt", "cvt", "dct", "top", "base", "one", "same", "its", "it",
+                            "this", "that", "cheaper", "cheapest", "facelift", "mid", "higher", "lower", "option"}
+
+
+def is_generic(mention: str) -> bool:
+    toks = norm(mention).split()
+    return not toks or all(t in GENERIC_MENTION for t in toks)
 GENERIC_TOKENS = {"grand", "range", "new", "city", "sport", "series", "class", "line", "plus", "max", "pro",
                   "electric", "ev", "lwb", "coupe", "next", "gen", "facelift", "edition", "urban", "cruiser"}
 
@@ -112,7 +121,7 @@ class CarResolver:
     def resolve(self, mention: str) -> list[Resolved]:
         """Best match first. If ambiguous, the first result lists the alternatives in .ambiguous."""
         q_full = norm(mention)
-        if not q_full:
+        if not q_full or is_generic(q_full):
             return []
         prefer_upcoming = any(w in q_full.split() for w in ("upcoming", "facelift", "next", "nextgen"))
         strip = lambda s: " ".join(w for w in s.split() if w not in FILLER)  # noqa: E731
@@ -133,11 +142,16 @@ class CarResolver:
         q = strip(q_full) or q_full
         if len(q.replace(" ", "")) < 3:
             return []
-        hits = process.extract(q, self.keys, scorer=fuzz.WRatio, limit=12, score_cutoff=84)
+        # token_set_ratio: 'grand vitara strong hybrid' ~ 'grand vitara'; ratio: typos ('cretta' ~ 'creta').
+        # (WRatio's partial matching let a shared token like 'ev' match unrelated models.)
+        hits = process.extract(q, self.keys, scorer=fuzz.token_set_ratio, limit=12, score_cutoff=86) + \
+            process.extract(q, self.keys, scorer=fuzz.ratio, limit=12, score_cutoff=84)
         if not hits:
             return []
         best: dict[str, tuple[float, str]] = {}
         for alias, score, _ in hits:
+            if not set(alias.split()) - GENERIC_MENTION and alias not in self.strong:
+                continue  # never match on generic tokens alone
             for mid in self.strong.get(alias, set()) | self.weak.get(alias, set()):
                 if brand_slug and self.models[mid]["brand_slug"] != brand_slug:
                     continue

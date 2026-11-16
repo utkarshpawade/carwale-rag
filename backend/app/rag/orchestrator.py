@@ -21,12 +21,12 @@ from ..memory import store
 from ..memory.store import ConvState
 from . import car_search, specs
 from .context import build_context
-from .entities import CarResolver, norm
+from .entities import CarResolver, is_generic, norm
 from .followups import suggest
 from .hybrid_search import hybrid_search
 from .schemas import PLAN_SCHEMA, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v4"  # bump when prompts / ranking change
+CACHE_VERSION = "v6"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
@@ -102,7 +102,9 @@ class Pipeline:
     # ------------------------------------------------------------------------------------------ resolve
     def _targets(self, plan: QueryPlan, st: ConvState) -> tuple[list[str], list[dict], list[str], list[str]]:
         ids: list[str] = []
-        if plan.refers_to == "focus" and st.focus_car:
+        # "its EV version" names the car explicitly: the named car replaces the remembered one unless comparing
+        explicit = bool(plan.cars) and plan.intent != "compare"
+        if plan.refers_to == "focus" and st.focus_car and not explicit:
             ids.append(st.focus_car)
         elif plan.refers_to == "all":
             ids += st.active_cars
@@ -110,11 +112,28 @@ class Pipeline:
             ids += [st.active_cars[i - 1] for i in plan.active_indices if 1 <= i <= len(st.active_cars)]
         resolved, unresolved, notes = [], [], []
         for car in plan.cars:
+            if is_generic(car.mention):
+                # a modifier of the focus car: "its EV version" -> Punch EV; "the diesel one" -> focus car + fuel hint
+                if st.focus_car:
+                    target = st.focus_car
+                    wants_ev = car.fuel_hint == "Electric" or {"ev", "electric"} & set(norm(car.mention).split())
+                    if wants_ev and not self.resolver.models.get(target, {}).get("is_ev"):
+                        ev = self.resolver.resolve(f"{self.resolver.name(target)} EV")
+                        if ev and self.resolver.models[ev[0].model_id].get("is_ev"):
+                            target = ev[0].model_id
+                    resolved.append({"mention": car.mention, "model_id": target, "name": self.resolver.name(target),
+                                     "score": "memory", "ambiguous": []})
+                    ids.append(target)
+                continue
             res = self.resolver.resolve(car.mention)
             if not res:
                 unresolved.append(car.mention)
                 continue
             top = res[0]
+            if car.fuel_hint == "Electric" and not self.resolver.models[top.model_id].get("is_ev"):
+                ev = self.resolver.resolve(f"{car.mention} EV")  # "Punch, electric" -> the separate Punch EV model
+                if ev and self.resolver.models[ev[0].model_id].get("is_ev"):
+                    top = ev[0]
             alts = [a for a in top.ambiguous if self.resolver.models[a].get("status") == "launched"][:1]
             resolved.append({"mention": car.mention, "model_id": top.model_id, "name": top.full_name,
                              "score": top.score, "ambiguous": alts})

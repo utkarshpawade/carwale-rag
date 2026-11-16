@@ -16,7 +16,7 @@ log = logging.getLogger("carwale")
 
 async def build_pipeline(s: Settings) -> Pipeline:
     await db.init_pool(s.database_url)
-    models = await db.fetch("SELECT id, brand, brand_slug, name, slug, full_name, status, user_rating_count FROM models")
+    models = await db.fetch("SELECT id, brand, brand_slug, name, slug, full_name, status, user_rating_count, is_ev FROM models")
     resolver = CarResolver(models)
     stats = await db.fetchrow("""
         SELECT (SELECT COUNT(*) FROM models WHERE status = 'launched') AS models,
