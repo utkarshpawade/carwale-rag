@@ -112,13 +112,28 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
   feedback and FAQs, and say plainly what isn't available.
 
 ## Groq free-tier strategy
-- **Exactly 2 LLM calls per turn.** The planner call is ~1.5K tokens and the answer call ~4K. Follow-up chips are template-based, so they cost no tokens.
-- **Fallback chain per role.** A model that returns 429 goes on cooldown for its `retry-after` window. Limits are per model, so the chain multiplies capacity:
-  - planner: `gpt-oss-20b` → `qwen3.8-27b` → `llama-3.1-8b-instant`
-  - answer: `gpt-oss-120b` → `llama-3.3-70b-versatile` → `gpt-oss-20b`
-- **Prompt-cache-friendly layout.** Static prompts come first. Groq doesn't count cached tokens against rate limits.
-- **Answer cache** for first-turn questions, which makes the starter chips instant and free. There's also a per-IP rate limit to protect the shared key.
+- **Models:** this free-tier key can access only `gpt-oss-120b`, `gpt-oss-20b` and `qwen3.8-27b`; the Llama models are not available (checked via `/models`). Each model has its own limits, read from the response headers: 8K tokens per minute and 1K requests per day.
+- **Exactly 2 LLM calls per turn:**
+  - The planner runs on `qwen3.8-27b` with no reasoning tokens: ~1.7K prompt + ~200 output.
+  - The answer runs on `gpt-oss-120b`: ~2.8K prompt + ~700 output.
+  - The two roles use different models, so they draw on separate rate-limit buckets.
+  - Follow-up chips are template-based, so they cost no tokens.
+- **Client-side token budgeting:** Groq reserves prompt + `max_completion_tokens` up front. The client reads `x-ratelimit-remaining-tokens` and `x-ratelimit-reset-tokens` after each call and skips any model that can't fit the next request.
+- **Fallback chains** (8-second planner timeout, 12-second stream timeout):
+  - planner: `qwen3.8-27b` → `gpt-oss-20b` → `gpt-oss-120b`
+  - answer: `gpt-oss-120b` → `gpt-oss-20b` → `qwen3.8-27b`
+- **Rate limits:** models that return 429 go on cooldown for their `retry-after` window. When every model is busy, the pipeline waits it out and retries, with a visible "retrying in N s" status, instead of failing.
+- **Null-tolerant plan schema:** some models emit `null` for empty lists even in strict mode, and Groq rejects that with `json_validate_failed`. The schema therefore accepts null, and Pydantic normalises it to `[]` or a default.
+- **Answer cache:** first-turn questions are cached, keyed by pipeline version, data snapshot and question. A per-IP rate limit protects the shared key.
 - **Demo the fallback chain:** set `FORCE_FAIL_MODELS=openai/gpt-oss-120b`.
+
+## Evaluation results
+`python eval/run_eval.py` (dry run: planner + routing + retrieval) on 20 single-turn and 7 multi-turn cases gives
+**27/27 passed (100%)**, with planner + retrieval latency of **p50 784 ms and p95 1.25 s**.
+
+The cases cover every intent; typos, renames and Hinglish ("fortuneer", "xuv700", "brezza ka mileage kitna hai"); structured searches with numeric and feature filters; references to earlier turns ("which one", "its", "the second one"); and refinement ("only 7 seaters").
+
+A full answer takes about 2–3 seconds end to end, with the first token after ~1–1.5 seconds.
 
 ## API
 | Method | Path | Purpose |

@@ -2,15 +2,27 @@
 from __future__ import annotations
 
 import copy
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel
 
 Fuel = Literal["Petrol", "Diesel", "CNG", "Electric", "Hybrid"]
 Body = Literal["SUV", "MUV", "Hatchback", "Sedan", "Coupe", "Convertible", "Pickup", "Van", "Wagon"]
 Intent = Literal["recommend", "spec", "price", "feature_check", "compare", "safety", "service", "review",
                  "variant_advice", "general", "chitchat", "out_of_scope"]
 SortBy = Literal["relevance", "price_asc", "price_desc", "mileage", "range", "power", "safety", "boot_space", "rating"]
+
+# Some models emit null for "empty" fields even under a strict schema (Groq then rejects the output with
+# json_validate_failed). Accept null in the schema and normalise it here, so code always sees lists/defaults.
+FuelList = Annotated[list[Fuel] | None, AfterValidator(lambda v: [] if v is None else v)]
+HybridList = Annotated[list[Literal["mild", "strong", "plug-in"]] | None, AfterValidator(lambda v: [] if v is None else v)]
+BodyList = Annotated[list[Body] | None, AfterValidator(lambda v: [] if v is None else v)]
+StrList = Annotated[list[str] | None, AfterValidator(lambda v: [] if v is None else v)]
+IntList = Annotated[list[int] | None, AfterValidator(lambda v: [] if v is None else v)]
+RefersTo = Annotated[Literal["none", "focus", "all", "indices"] | None, AfterValidator(lambda v: v or "none")]
+FilterMode = Annotated[Literal["new", "refine", "none"] | None, AfterValidator(lambda v: v or "none")]
+Sort = Annotated[SortBy | None, AfterValidator(lambda v: v or "relevance")]
+Status = Annotated[Literal["launched", "upcoming"] | None, AfterValidator(lambda v: v or "launched")]
 
 FEATURE_TAGS = [
     "sunroof", "panoramic_sunroof", "ventilated_seats", "wireless_charger", "360_camera", "reverse_camera",
@@ -32,30 +44,30 @@ class CarRef(BaseModel):
 class Filters(BaseModel):
     price_min: int | None
     price_max: int | None
-    fuel_types: list[Fuel]
-    hybrid_types: list[Literal["mild", "strong", "plug-in"]]
-    body_types: list[Body]
+    fuel_types: FuelList
+    hybrid_types: HybridList
+    body_types: BodyList
     transmission: Literal["Manual", "Automatic"] | None
     seats_min: int | None
-    brands: list[str]
-    feature_tags: list[str]
+    brands: StrList
+    feature_tags: StrList
     ncap_min: int | None
     mileage_min: float | None
-    status: Literal["launched", "upcoming"]
+    status: Status
 
 
 class QueryPlan(BaseModel):
     standalone_query: str
     intent: Intent
-    cars: list[CarRef]
-    refers_to: Literal["none", "focus", "all", "indices"]
-    active_indices: list[int]
+    cars: Annotated[list[CarRef] | None, AfterValidator(lambda v: [] if v is None else v)]
+    refers_to: RefersTo
+    active_indices: IntList
     filters: Filters
-    filter_mode: Literal["new", "refine", "none"]
-    prefer_tags: list[str]
-    sort_by: SortBy
-    aspects: list[str]
-    keywords: list[str]
+    filter_mode: FilterMode
+    prefer_tags: StrList
+    sort_by: Sort
+    aspects: StrList
+    keywords: StrList
     city: str | None
     clarify: str | None
 

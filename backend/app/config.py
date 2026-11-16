@@ -16,9 +16,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@localhost:5433/carwale"
 
     # role -> ordered fallback chain (comma separated)
-    planner_models: str = "openai/gpt-oss-20b,qwen/qwen3.8-27b,llama-3.1-8b-instant"
-    answer_models: str = "openai/gpt-oss-120b,llama-3.3-70b-versatile,openai/gpt-oss-20b"
-    summary_models: str = "llama-3.1-8b-instant,openai/gpt-oss-20b"
+    # Only models this free-tier key can access (checked via /models, Nov 2026); all support strict JSON schema.
+    # Planner on qwen (no reasoning tokens), answers on gpt-oss-120b: separate per-model TPM buckets.
+    planner_models: str = "qwen/qwen3.8-27b,openai/gpt-oss-20b,openai/gpt-oss-120b"
+    answer_models: str = "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b"
+    summary_models: str = "openai/gpt-oss-20b,qwen/qwen3.8-27b"
     force_fail_models: str = ""  # comma separated: simulate 429s to demo/test the fallback chain
 
     embed_model: str = "BAAI/bge-small-en-v1.5"
@@ -31,8 +33,9 @@ class Settings(BaseSettings):
     max_input_chars: int = 1000
 
     # token budgets
-    context_token_budget: int = 2200
-    answer_max_tokens: int = 1100
+    context_token_budget: int = 1800
+    answer_max_tokens: int = 1000
+    planner_max_tokens: int = 700
     history_turns: int = 3
     summarize_after_messages: int = 8
 

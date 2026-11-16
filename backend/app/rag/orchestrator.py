@@ -26,6 +26,7 @@ from .followups import suggest
 from .hybrid_search import hybrid_search
 from .schemas import PLAN_SCHEMA, Filters, QueryPlan, empty_filters, simple_plan
 
+CACHE_VERSION = "v3"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
@@ -123,7 +124,7 @@ class Pipeline:
                 notes.append(f"'{car.mention}' matches more than one model ({', '.join(self.resolver.name(x) for x in [top.model_id] + alts)}); covering each.")
         if not ids and plan.intent in CAR_INTENTS and st.focus_car and not unresolved and not plan.cars:
             ids.append(st.focus_car)  # planner forgot refers_to
-        return list(dict.fromkeys(ids))[:4], resolved, unresolved, notes
+        return list(dict.fromkeys(ids)), resolved, unresolved, notes  # capped per route (details: 4)
 
     # ------------------------------------------------------------------------------------------ main turn
     async def run(self, conv_id: str, user_id: str, message: str, dry_run: bool = False) -> AsyncIterator[Event]:
@@ -137,7 +138,8 @@ class Pipeline:
 
         cache_key = None
         if not history and not SMALLTALK.match(message) and not dry_run:
-            cache_key = hashlib.sha1(f"v1|{norm(message)}".encode()).hexdigest()
+            # versioned by pipeline revision + data snapshot, so re-ingestion or prompt changes never serve stale answers
+            cache_key = hashlib.sha1(f"{CACHE_VERSION}|{self.stats.get('snapshot')}|{norm(message)}".encode()).hexdigest()
             cached = await store.cache_get(cache_key)
             if cached:
                 async for ev in self._replay(conv_id, st, cached, timer):
@@ -149,12 +151,19 @@ class Pipeline:
         if SMALLTALK.match(message):
             plan = simple_plan(message, "chitchat")
         else:
-            try:
-                plan, planner_info = await self.llm.json("planner", self._planner_messages(message, history, st),
-                                                         QueryPlan, PLAN_SCHEMA, max_tokens=1000)
-            except LLMUnavailable as e:
-                yield Event("error", {"message": self._busy(e)})
-                return
+            plan = None
+            for attempt in range(3):  # wait out short free-tier rate-limit windows instead of failing
+                try:
+                    plan, planner_info = await self.llm.json("planner", self._planner_messages(message, history, st),
+                                                             QueryPlan, PLAN_SCHEMA, max_tokens=self.s.planner_max_tokens)
+                    break
+                except LLMUnavailable as e:
+                    if e.auth or attempt == 2 or (e.retry_after or 0) > 30:
+                        yield Event("error", {"message": self._busy(e)})
+                        return
+                    wait = min(max(e.retry_after or 3.0, 1.5), 30.0)
+                    yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
+                    await asyncio.sleep(wait)
         timer.mark("plan")
 
         # ---- 2. resolve
@@ -226,6 +235,7 @@ class Pipeline:
                 new_active, new_focus = ids, ids[0]
             new_filters = f.model_dump()
         elif target_ids:
+            target_ids = target_ids[:4]  # fact sheets / comparison tables stay readable and within budget
             yield Event("status", {"text": "Reading " + ", ".join(self.resolver.name(i) for i in target_ids) + " data…"})
             models = await specs.load_models(target_ids)
             variants = await specs.load_variants(target_ids)
@@ -306,17 +316,24 @@ class Pipeline:
         msgs.append({"role": "user", "content": f"{context}\n\n## QUESTION\n{q}"})
         answer_info = CallInfo("answer")
         parts: list[str] = []
-        try:
-            async for delta in self.llm.stream("answer", msgs, self.s.answer_max_tokens, answer_info):
-                if not parts:
-                    timer.mark("first_token")
-                parts.append(delta)
-                yield Event("token", {"text": delta})
-        except LLMUnavailable as e:
-            if not parts:
-                yield Event("error", {"message": self._busy(e)})
-                return
-            parts.append("\n\n_(answer cut short: the AI service is busy)_")
+        for attempt in range(3):
+            try:
+                async for delta in self.llm.stream("answer", msgs, self.s.answer_max_tokens, answer_info):
+                    if not parts:
+                        timer.mark("first_token")
+                    parts.append(delta)
+                    yield Event("token", {"text": delta})
+                break
+            except LLMUnavailable as e:
+                if parts:
+                    parts.append("\n\n_(answer cut short: the AI service is busy)_")
+                    break
+                if e.auth or attempt == 2 or (e.retry_after or 0) > 30:
+                    yield Event("error", {"message": self._busy(e)})
+                    return
+                wait = min(max(e.retry_after or 3.0, 1.5), 30.0)
+                yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
+                await asyncio.sleep(wait)
         answer = "".join(parts).strip()
         timer.mark("total")
 

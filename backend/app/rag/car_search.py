@@ -20,7 +20,9 @@ SORTS = {
 }
 
 SCORE = ("(SELECT COUNT(*) FROM unnest(m.feature_tags) t WHERE t = ANY(%(prefer)s)) * 2.0"
-         " + LN(1 + COALESCE(m.user_rating_count, 0)) * 0.6 + COALESCE(m.user_rating, 3.5) * 0.5")
+         " + LN(1 + COALESCE(m.user_rating_count, 0)) * 0.6 + COALESCE(m.user_rating, 3.5) * 0.5"
+         # for 'hybrid' searches, true (strong/plug-in) hybrids outrank mild hybrids
+         " + CASE WHEN BOOL_OR(v.hybrid_type IN ('strong', 'plug-in')) THEN %(hyboost)s::float ELSE 0 END")
 
 
 def _where(f: Filters, brand_slugs: list[str], restrict_ids: list[str] | None) -> tuple[list[str], dict, list[str]]:
@@ -72,7 +74,8 @@ def _where(f: Filters, brand_slugs: list[str], restrict_ids: list[str] | None) -
 
 async def _run(f: Filters, sort_by: str, prefer: list[str], brand_slugs: list[str], restrict_ids, limit: int):
     where, p, desc = _where(f, brand_slugs, restrict_ids)
-    p.update({"prefer": [t for t in prefer if t in FEATURE_TAGS], "limit": limit})
+    hybrid_search = bool(f.hybrid_types) or "Hybrid" in f.fuel_types
+    p.update({"prefer": [t for t in prefer if t in FEATURE_TAGS], "limit": limit, "hyboost": 2.0 if hybrid_search else 0.0})
     sql = f"""
     SELECT m.id, m.full_name, m.brand, m.body_type_raw, m.url, m.image_url, m.user_rating, m.user_rating_count,
            m.ncap_rating, m.ncap_agency, m.status, m.feature_tags, m.price_min, m.price_max,
@@ -117,6 +120,15 @@ async def search_cars(f: Filters, sort_by: str, prefer: list[str], brand_slugs: 
     """-> (rows, human-readable filter description, relaxation notes)."""
     rows, desc = await _run(f, sort_by, prefer, brand_slugs, restrict_ids, limit)
     notes: list[str] = []
+    htypes = set(f.hybrid_types) | ({"strong", "mild", "plug-in"} if "Hybrid" in f.fuel_types and not f.hybrid_types else set())
+    if rows and not restrict_ids and {"mild", "strong"} <= htypes and len(rows) >= limit - 1:
+        # diversity: keep two mild-hybrid slots so the answer can contrast mild vs strong hybrids
+        if sum(1 for r in rows if not ({"strong", "plug-in"} & set(r.get("hybrid_types") or []))) < 2:
+            mild = f.model_copy(update={"hybrid_types": ["mild"], "fuel_types": []})
+            extra, _ = await _run(mild, sort_by, prefer, brand_slugs, None, 4)
+            extra = [r for r in extra if r["id"] not in {x["id"] for x in rows}][:2]
+            if extra:
+                rows = rows[: limit - len(extra)] + extra
     if rows or restrict_ids:
         return rows, desc, notes
     relaxed = f.model_copy(deep=True)

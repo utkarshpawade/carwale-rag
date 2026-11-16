@@ -420,11 +420,20 @@ def main() -> None:
             trim_items, tree, trim_faqs, tree_version = {}, {}, [], None
             top_trim = next((t for t in model["trims"] if (mp.get("modelDetails") or {}).get("topVariant") in t["version_ids"]), None)
             top_trim = top_trim or (model["trims"][-1] if model["trims"] else None)
-            if top_trim:
-                th = read_cached(top_trim["url"])
+            # every cached trim page of this model: merge version specs, keep the richest feature tree
+            ordered = ([top_trim] if top_trim else []) + [t for t in reversed(model["trims"]) if t is not top_trim]
+            for t in ordered:
+                th = read_cached(t["url"])
                 tp = (extract_state(th) or {}).get("trimPage") if th else None
-                if tp:
-                    trim_items, tree, trim_faqs, tree_version = parse_trim(tp)
+                if not tp:
+                    continue
+                items, tr, faqs_t, ver = parse_trim(tp)
+                for vid, its in items.items():
+                    trim_items.setdefault(vid, its)
+                if len(tr) > len(tree):
+                    tree, tree_version = tr, ver
+                if not trim_faqs:
+                    trim_faqs = faqs_t
             model["faqs"].extend(trim_faqs)
             mvars = [build_variant(b, trim_items.get(b["version_id"]), model) for b in base_vars]
             models.append(finalize_model(model, mvars, tree, tree_version))

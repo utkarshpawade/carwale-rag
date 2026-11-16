@@ -92,6 +92,23 @@ def top_trim_urls(model_urls: list[str]) -> list[str]:
     return out
 
 
+EDITION_WORDS = ("edition", "blaq", "black", "dark", "limited", "anniversary", "jahre", "centenary", "bold", "special")
+
+
+def alt_trim_urls(min_groups: int = 15) -> list[str]:
+    """Special-edition trim pages often carry a sparse feature tree; pick a regular trim instead."""
+    out = []
+    for line in (DATA / "processed" / "models.jsonl").open(encoding="utf-8"):
+        m = json.loads(line)
+        if m["status"] != "launched" or len(m["top_variant_features"]["groups"]) >= min_groups:
+            continue
+        trims = list(reversed(m["trims"]))  # highest trims first
+        regular = [t for t in trims if not any(w in (t["slug"] or "") for w in EDITION_WORDS)]
+        for t in (regular or trims)[:2]:
+            out.append(t["url"])
+    return out
+
+
 def main() -> None:
     what = sys.argv[1] if len(sys.argv) > 1 else "models"
     model_urls = json.loads((DATA / "urls_models.json").read_text(encoding="utf-8"))
@@ -100,8 +117,10 @@ def main() -> None:
     elif what == "trims":
         urls = top_trim_urls(model_urls)
         (DATA / "urls_trims.json").write_text(json.dumps(urls, indent=1), encoding="utf-8")
+    elif what == "alt_trims":
+        urls = alt_trim_urls()
     else:
-        raise SystemExit("usage: python -m ingestion.fetch [models|trims]")
+        raise SystemExit("usage: python -m ingestion.fetch [models|trims|alt_trims]")
     asyncio.run(fetch_all(urls))
 
 
