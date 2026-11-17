@@ -26,7 +26,7 @@ from .followups import suggest
 from .hybrid_search import hybrid_search, pinned_chunks
 from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v7"  # bump when prompts / ranking change
+CACHE_VERSION = "v8"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
@@ -330,6 +330,12 @@ class Pipeline:
                 cards.append(specs.card(m))
                 if not compare:
                     blocks.append(specs.facts_block(m["full_name"], m["url"], fs))
+                    wanted = list(dict.fromkeys(plan.filters.feature_tags + specs.detect_features(
+                        " ".join([message, plan.standalone_query] + plan.keywords))))
+                    if wanted and plan.intent in ("feature_check", "variant_advice", "spec", "price"):
+                        blocks.append(specs.feature_availability(m["full_name"], vs, wanted))
+                    elif plan.intent in ("feature_check", "variant_advice"):
+                        blocks.append(specs.trim_feature_matrix(m["full_name"], vs))
                     if plan.intent in ("feature_check", "variant_advice", "price") or "variants" in aspects:
                         blocks.append(f"Variants of {m['full_name']}:\n" + specs.variants_table(vs))
                 rivals += [self.resolver.name(x) for x in ((m.get("data") or {}).get("similar") or [])[:2]]

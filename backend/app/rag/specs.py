@@ -190,6 +190,81 @@ def facts(m: dict, vs: list[dict], aspects: set[str], city: str | None = None, c
     return f
 
 
+FEATURE_SYNONYMS = {
+    "ventilated": "ventilated_seats", "cooled seat": "ventilated_seats", "panoramic sunroof": "panoramic_sunroof",
+    "panoramic roof": "panoramic_sunroof", "panoramic": "panoramic_sunroof",
+    "sunroof": "sunroof", "moonroof": "sunroof", "adaptive cruise": "adaptive_cruise", "cruise": "cruise_control",
+    "adas": "adas", "360": "360_camera", "surround camera": "360_camera", "wireless charg": "wireless_charger",
+    "head-up": "hud", "head up": "hud", "hud": "hud", "wireless carplay": "wireless_carplay",
+    "wireless android auto": "wireless_carplay", "carplay": "apple_carplay_android_auto",
+    "android auto": "apple_carplay_android_auto", "connected car": "connected_car", "connected": "connected_car",
+    "over the air": "ota_updates", "ota": "ota_updates", "tyre pressure": "tpms", "tpms": "tpms", "esc": "esc",
+    "stability control": "esc", "hill hold": "hill_hold", "hill assist": "hill_hold", "6 airbag": "6_airbags",
+    "six airbag": "6_airbags", "4x4": "4x4", "awd": "4x4", "4wd": "4x4", "ambient": "ambient_lighting",
+    "leather": "leather_seats", "powered seat": "powered_seats", "electric seat": "powered_seats",
+    "power seat": "powered_seats", "led headl": "led_headlights", "push button": "keyless_start",
+    "keyless": "keyless_start", "rear ac": "rear_ac_vents", "dashcam": "dashcam", "dash cam": "dashcam",
+    "front parking sensor": "front_parking_sensors", "touchscreen": "touchscreen", "emergency braking": "aeb",
+    "aeb": "aeb", "lane keep": "lane_keep_assist", "blind spot": "blind_spot_monitor", "dual zone": "dual_zone_climate",
+    "climate control": "auto_climate", "automatic climate": "auto_climate", "reverse camera": "reverse_camera",
+    "rear camera": "reverse_camera", "parking camera": "reverse_camera", "electric parking brake": "electric_parking_brake",
+    "voice command": "voice_commands", "turbo": "turbo",
+}
+
+
+def detect_features(text: str) -> list[str]:
+    """Feature tags named in free text ('which variants get ventilated seats' -> ['ventilated_seats'])."""
+    low, hits = text.lower(), []
+    for phrase in sorted(FEATURE_SYNONYMS, key=len, reverse=True):  # longest phrase wins ("panoramic sunroof")
+        idx = low.find(phrase)
+        while idx >= 0:
+            hits.append((idx, FEATURE_SYNONYMS[phrase]))
+            low = low[:idx] + " " * len(phrase) + low[idx + len(phrase):]  # blank out, keep positions
+            idx = low.find(phrase)
+    out: list[str] = []
+    for _, tag in sorted(hits):  # report in the order the user mentioned them
+        if tag not in out:
+            out.append(tag)
+    return out
+
+
+def _trims(vs: list[dict]) -> "OrderedDict[str, dict]":
+    trims: "OrderedDict[str, dict]" = OrderedDict()
+    for v in sorted(vs, key=lambda x: x.get("price") or 0):
+        t = trims.setdefault(v.get("trim") or v["name"], {"tags": set(), "variants": []})
+        t["tags"] |= set(v.get("feature_tags") or [])
+        t["variants"].append(v)
+    return trims
+
+
+def feature_availability(name: str, vs: list[dict], tags: list[str]) -> str:
+    """Deterministic 'which trims have feature X' answer, so long variant lists never hide a trim."""
+    trims = _trims(vs)
+    lines = [f"Feature availability for {name} by trim (all {len(trims)} trims, from CarWale trim data):"]
+    for tag in tags:
+        with_ = [t for t, d in trims.items() if tag in d["tags"]]
+        without = [t for t in trims if t not in with_]
+        label = TAG_LABELS.get(tag, tag.replace("_", " "))
+        if not with_:
+            lines.append(f"- {label}: not available on any trim.")
+            continue
+        cheapest = min((v for t in with_ for v in trims[t]["variants"] if tag in (v.get("feature_tags") or []) and v.get("price")),
+                       key=lambda v: v["price"], default=None)
+        lines.append(f"- {label}: available on {', '.join(with_)}"
+                     + (f" (cheapest: {cheapest['name']} at {inr(cheapest['price'])})" if cheapest else "")
+                     + (f"; not on {', '.join(without)}" if without else "; on every trim") + ".")
+    return "\n".join(lines)
+
+
+def trim_feature_matrix(name: str, vs: list[dict], per_trim: int = 9) -> str:
+    trims = _trims(vs)
+    lines = [f"Key features of {name} by trim (cheapest to costliest):"]
+    for t, d in trims.items():
+        prices = [v["price"] for v in d["variants"] if v.get("price")]
+        lines.append(f"- {t} ({price_range(min(prices), max(prices)) if prices else 'n/a'}): {feature_list(sorted(d['tags']), per_trim)}")
+    return "\n".join(lines)
+
+
 def variants_table(vs: list[dict], limit: int = 14) -> str:
     lines = ["| Variant | Price | Fuel | Transmission | Mileage/Range | Notable features |", "|---|---|---|---|---|---|"]
     for v in vs[:limit]:

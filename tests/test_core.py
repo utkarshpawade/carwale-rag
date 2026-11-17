@@ -146,6 +146,17 @@ def test_plan_is_tolerant_of_imperfect_model_output():
     assert QueryPlan.model_validate({}).intent == "general"
 
 
+def test_feature_detection_and_availability():
+    from app.rag.specs import detect_features, feature_availability
+    assert detect_features("Which Sonet variants get ventilated seats and a panoramic sunroof?") == ["ventilated_seats", "panoramic_sunroof"]
+    assert detect_features("does it have adaptive cruise control") == ["adaptive_cruise"]
+    vs = [{"name": "A1", "trim": "A", "price": 800000, "feature_tags": []},
+          {"name": "B1", "trim": "B", "price": 1000000, "feature_tags": ["ventilated_seats"]},
+          {"name": "C1", "trim": "C", "price": 1200000, "feature_tags": ["ventilated_seats"]}]
+    out = feature_availability("Car", vs, ["ventilated_seats"])
+    assert "available on B, C" in out and "cheapest: B1" in out and "not on A" in out
+
+
 def test_split_text_keeps_lines_and_limit():
     from ingestion.build_chunks import split_text
     text = "\n".join(f"Group {i}: " + "; ".join(f"feature {i}-{j}" for j in range(40)) for i in range(6))

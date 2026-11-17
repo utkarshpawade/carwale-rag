@@ -6,6 +6,8 @@ import type { Source } from "../types";
 export default function Markdown({ text, sources }: { text: string; sources?: Source[] }) {
   const linked = text
     .replace(/【(\d{1,2})(?:†[^】]*)?】/g, "[$1]") // gpt-oss sometimes emits its native 【4†L1-L4】 citation style
+    .replace(/【[^】\d][^】]*】/g, "") // non-numeric pseudo-citations like 【CAR DATA】
+    .replace(/\s?\[(?:CAR DATA|data)\]/gi, "")
     .replace(/\[(\d{1,2})\](?!\()/g, (_m, n) => `[${n}](#cite-${n})`);
   return (
     <div className="answer prose prose-slate prose-sm max-w-none prose-p:my-2 prose-li:my-0.5 prose-ul:my-2 prose-table:my-3 prose-headings:mt-3 prose-headings:mb-1.5">
