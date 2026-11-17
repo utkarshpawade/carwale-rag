@@ -493,10 +493,123 @@ def load_articles() -> dict[str, list[dict]]:
     return by_model
 
 
+def stage3_urls(kind: str) -> list[str]:
+    path = DATA / "urls_stage3.json"
+    if not path.exists():
+        return []
+    urls = json.loads(path.read_text(encoding="utf-8"))
+    test = {"compare": lambda u: "/compare-cars/" in u,
+            "best": lambda u: "/compare-cars/" not in u and "/price-in-" not in u and not u.endswith("/news/")}[kind]
+    return [u for u in urls if test(u)]
+
+
+def norm_city(name: str | None) -> str:
+    return re.sub(r"[^a-z]", "", (name or "").lower())
+
+
+def city_price_pages(model_url: str) -> list[dict]:
+    """Per-variant on-road prices (+ one full breakup, nearby cities, city FAQs) from /price-in-<city>/ pages."""
+    out = []
+    for city in ("mumbai", "delhi"):
+        html = read_cached(f"{model_url}price-in-{city}/")
+        pc = (extract_state(html) or {}).get("priceInCityPage") if html else None
+        if not pc:
+            continue
+        cname = (pc.get("priceLocation") or {}).get("cityName") or city.title()
+        versions, names = [], {}
+        for v in pc.get("versions") or []:
+            names[v.get("versionId")] = v.get("versionName")
+            po = v.get("priceOverview") or {}
+            if "on-road" in (po.get("priceLabel") or "").lower() and positive(po.get("price")):
+                versions.append({"name": v.get("versionName"), "trim": v.get("trimName"), "on_road": po["price"],
+                                 "ex_showroom": positive(po.get("exShowRoomPrice"))})
+        breakup = None
+        for d in pc.get("detailedPriceList") or []:
+            for b in d.get("PriceBreakupList") or []:
+                if b.get("charges"):
+                    breakup = {"version": names.get((d.get("PriceCriteria") or {}).get("versionId")),
+                               "on_road": b.get("onRoad"), "ex_showroom": b.get("exShowRoom"),
+                               "charges": [{"name": c.get("name"), "group": c.get("chargeGroupName") or "", "value": c.get("value")}
+                                           for c in b["charges"] if c.get("value")]}
+                    break
+            if breakup:
+                break
+        nearby = [{"city": c.get("name"), "range": c.get("onRoadPrice"), "min": positive(to_int(c.get("unformattedOnRoadPrice"))),
+                   "max": positive(to_int(c.get("onRoadMaxPrice")))} for c in pc.get("nearByCities") or [] if c.get("onRoadPrice")]
+        faqs = [{"category": f"On-road price ({cname})", "q": clean_text(f.get("question")), "a": clean_text(f.get("answer"))}
+                for f in pc.get("faqs") or [] if f.get("question")]
+        out.append({"city": cname, "versions": versions, "breakup": breakup, "nearby": nearby, "faqs": faqs})
+    return out
+
+
+def news_headlines(model_url: str, limit: int = 15) -> list[dict]:
+    html = read_cached(f"{model_url}news/")
+    el = (extract_state(html) or {}).get("editorialListing") if html else None
+    out = []
+    for i in ((el or {}).get("contentData") or [])[:limit]:
+        if i.get("title"):
+            u = i.get("url") or ""
+            out.append({"title": clean_text(i["title"]), "date": i.get("displayDate"),
+                        "url": f"https://www.carwale.com{u}" if u.startswith("/") else u})
+    return out
+
+
+def load_comparisons() -> dict[str, list[dict]]:
+    """CarWale's written verdicts for rival pairs; templated boilerplate ('CarWale brings you comparison...') is dropped."""
+    slug2id = {}
+    for u in json.loads((DATA / "urls_models.json").read_text(encoding="utf-8")):
+        m = re.search(r"carwale\.com/([a-z0-9-]+)-cars/([a-z0-9-]+)/", u)
+        if m:
+            slug2id[f"{m.group(1)}-{m.group(2)}"] = f"{m.group(1)}/{m.group(2)}"
+    by_model: dict[str, list[dict]] = {}
+    for url in stage3_urls("compare"):
+        html = read_cached(url)
+        cc = (extract_state(html) or {}).get("compareCarDetails") if html else None
+        if not cc:
+            continue
+        text = clean_text((cc.get("metaData") or {}).get("comparisionText"))
+        if text.lower().startswith("carwale brings you comparison"):
+            text = ""  # templated boilerplate, not an expert verdict
+        a, _, b = url.rstrip("/").split("/")[-1].partition("-vs-")
+        ida, idb = slug2id.get(a), slug2id.get(b)
+        # CarWale's expert take on each car of the pair (same order as in the URL)
+        takes = [clean_text(v.get("verdict")) for v in cc.get("verdictInfoList") or []]
+        if not ida or not idb or not (text or any(takes)):
+            continue
+        rec = {"pair": [ida, idb], "text": text, "takes": takes[:2], "url": url,
+               "road_tests": [clean_text(r.get("title")) for r in cc.get("roadTestList") or [] if r.get("title")][:4]}
+        by_model.setdefault(ida, []).append(rec)  # one record per pair, stored under the first car
+    return by_model
+
+
+def load_best_lists() -> list[dict]:
+    """CarWale's curated 'best cars ...' pages: ranked models, summary text and FAQs."""
+    out = []
+    for url in stage3_urls("best"):
+        html = read_cached(url)
+        fp = (extract_state(html) or {}).get("filterPage") if html else None
+        if not fp or not fp.get("models"):
+            continue
+        meta = fp.get("pageMetaTags") or {}
+        ranked = []
+        for m in fp["models"]:
+            po = m.get("priceOverview") or {}
+            ranked.append({"id": f"{m.get('makeMaskingName')}/{m.get('modelMaskingName')}",
+                           "name": f"{m.get('makeName')} {m.get('modelName')}",
+                           "price": clean_text(po.get("formattedPriceRangeText") or po.get("formattedPrice")),
+                           "rating": m.get("carRating")})
+        out.append({"title": clean_text(meta.get("heading") or meta.get("title")), "url": url, "ranked": ranked,
+                    "summary": "\n".join(t for t in (clean_text(meta.get("seoText")), clean_text(fp.get("seoText"))) if t),
+                    "faqs": [{"q": clean_text(f.get("question")), "a": clean_text(f.get("answer"))}
+                             for f in fp.get("faqs") or [] if f.get("question")]})
+    return out
+
+
 def main() -> None:
     model_urls = json.loads((DATA / "urls_models.json").read_text(encoding="utf-8"))
     models, variants, errors = [], [], []
     articles = load_articles()
+    comparisons = load_comparisons()
     for url in model_urls:
         html = read_cached(url)
         if not html:
@@ -537,6 +650,19 @@ def main() -> None:
                     v["feature_tags"] = sorted(set(v["feature_tags"]) | set(tree_tags(ti["groups"])))
             model["owner_reviews"] = merge_reviews(model["owner_reviews"], review_page_reviews(url))
             model["expert_articles"] = articles.get(model["id"], [])
+            model["city_pages"] = city_price_pages(url)
+            for cp in model["city_pages"]:
+                model["faqs"].extend(cp.pop("faqs"))
+                known = {norm_city(c["city"]) for c in model["city_prices"]}
+                ons = [v["on_road"] for v in cp["versions"]]
+                if ons and norm_city(cp["city"]) not in known:
+                    model["city_prices"].append({"city": cp["city"], "range": f"{min(ons) / 1e5:.2f} - {max(ons) / 1e5:.2f} Lakh",
+                                                 "min": min(ons), "max": max(ons)})
+                for nb in cp["nearby"]:  # nearby-city on-road ranges widen city coverage
+                    if norm_city(nb["city"]) not in {norm_city(c["city"]) for c in model["city_prices"]}:
+                        model["city_prices"].append(nb)
+            model["news"] = news_headlines(url)
+            model["comparisons"] = comparisons.get(model["id"], [])
             models.append(finalize_model(model, mvars, tree, tree_version))
             variants.extend(mvars)
         except Exception as e:  # keep going; report at the end
@@ -544,7 +670,14 @@ def main() -> None:
 
     n_m = write_jsonl(PROCESSED / "models.jsonl", models)
     n_v = write_jsonl(PROCESSED / "variants.jsonl", variants)
+    best = load_best_lists()
+    n_b = write_jsonl(PROCESSED / "best_lists.jsonl", best)
     report(models, variants)
+    L = [m for m in models if m["status"] == "launched"]
+    print(f"city on-road pages: {sum(len(m.get('city_pages') or []) for m in L)} | cities covered (avg/model): "
+          f"{sum(len(m['city_prices']) for m in L) / max(len(L), 1):.1f} | news headlines: {sum(len(m.get('news') or []) for m in L)} | "
+          f"rival pairs: {sum(len(m.get('comparisons') or []) for m in L)} "
+          f"(written verdicts: {sum(1 for m in L for c in m.get('comparisons') or [] if c['text'])}) | best lists: {n_b}")
     print(f"\nwrote {n_m} models, {n_v} variants; errors: {len(errors)}")
     for u, e in errors[:15]:
         print("  ERR", u, e)

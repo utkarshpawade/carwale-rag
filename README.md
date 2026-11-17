@@ -5,7 +5,14 @@ Ask anything about new cars in India: prices, mileage, specs, features, safety, 
 conversation, so follow-ups such as *"which one has the best mileage?"*, *"what about its safety?"* and
 *"only 7 seaters"* just work.
 
-- **Data:** 400 models (288 on sale, 112 upcoming), 2,283 variants, 912 trim feature trees, 4,458 owner reviews and 390 expert articles (incl. 54 long-term reports), giving 21,416 retrieval chunks crawled politely from carwale.com
+- **Data:** about 4,300 pages crawled politely from carwale.com, giving 25,200 retrieval chunks. They cover:
+  - 400 models (288 on sale, 112 upcoming) and 2,283 variants
+  - 912 trim feature trees
+  - 4,458 owner reviews and 390 expert articles, including 54 long-term reports
+  - per-variant on-road prices for Mumbai and Delhi, with city coverage of about 28 cities per model
+  - 3,481 news headlines
+  - 596 rival-pair comparisons
+  - 306 of CarWale's "best cars" lists
 - **Stack:** FastAPI · Groq (gpt-oss-120b / gpt-oss-20b / Llama 3.x) · Postgres + pgvector (Neon) · fastembed (bge-small, ONNX) · React + Vite + Tailwind
 - **Live:** app **https://carwale-rag.vercel.app** · API **https://carwale-rag-api.onrender.com** ([health](https://carwale-rag-api.onrender.com/api/health), [docs](https://carwale-rag-api.onrender.com/docs)). The free Render instance sleeps when idle; the first request wakes it in about a minute.
 
@@ -86,6 +93,12 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
   - **Every trim page (912):** each trim's full feature tree plus CarWale's own diff of what it adds over the trim below. This powers "which variant has X" and "is SX worth it over S".
   - **Owner-review pages:** up to 3 per model (30 reviews), giving 4,458 reviews in total. Each has category ratings, including after-sales cost and experience.
   - **Expert articles (390):** long-term reports (city/highway mileage, 10,000 km service visits), first drives and the like. Articles about an earlier generation of the same nameplate are labelled as such.
+- **Third pass (`discover_more 3`):** about 2,000 more pages:
+  - **City price pages (Mumbai and Delhi):** per-variant on-road prices, the full breakup (RTO, insurance, TCS, FASTag, optional extended warranty and maintenance packages), city FAQs, and on-road ranges for about 10 nearby cities each.
+  - **News listings:** the latest headlines per model.
+  - **CarWale's "best cars" lists (306):** ranked picks by budget, body type, fuel, gearbox, seats and brand. One is attached only when its title matches every filter in the question.
+  - **Rival comparison pages (596 pairs):** CarWale's expert take on each car, plus a written verdict for popular pairs such as Creta vs Seltos. Templated boilerplate is dropped.
+  - **Checked and not usable:** the service-cost fields on the city and compare pages are present but empty, which confirms CarWale publishes no service costs.
 - **Captured per model:**
   - prices (ex-showroom per version, plus on-road prices in 8 cities)
   - full specs and features

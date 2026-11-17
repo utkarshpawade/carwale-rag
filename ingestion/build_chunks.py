@@ -69,11 +69,11 @@ class Chunker:
         self.counter = Counter()
 
     def add(self, m: dict | None, section: str, title: str, body: str, url: str | None = None,
-            variant_id: int | None = None) -> None:
+            variant_id: int | None = None, free_prefix: str = "Car glossary", free_key: str = "glossary") -> None:
         for piece in split_text(body):
-            key = (m["id"] if m else "glossary", section)
+            key = (m["id"] if m else free_key, section)
             self.counter[key] += 1
-            content = (header(m, title) if m else f"Car glossary — {title}") + "\n" + piece
+            content = (header(m, title) if m else f"{free_prefix} — {title}") + "\n" + piece
             self.rows.append({
                 "id": f'{key[0]}::{section}::{self.counter[key]}',
                 "model_id": m["id"] if m else None,
@@ -303,8 +303,77 @@ def model_chunks(ch: Chunker, m: dict, vars_: list[dict]) -> None:
         body = (f"{'Critical owner review' if r['kind'] == 'critical' else 'Owner review'} ({r.get('rating') or 'n/a'}/5, "
                 f"{r.get('date') or ''}{'; ' + meta if meta else ''}): {r['title']}\n{r['text']}\nRatings: {params}")
         ch.add(m, "owner_reviews", "Owner review", body[: MAX_CHARS])
-    if m.get("latest_updates"):
-        ch.add(m, "news", "Latest updates", "\n".join(f"- {u['date']}: {u['title']}" for u in m["latest_updates"]))
+    news, seen = [], set()
+    for d, t in [(u.get("date"), u["title"]) for u in m.get("latest_updates") or []] + \
+                [(n.get("date"), n["title"]) for n in m.get("news") or []]:
+        if t and t.lower()[:80] not in seen:
+            seen.add(t.lower()[:80])
+            news.append(f"- {t}" + (f" ({d})" if d else ""))
+    if news:
+        ch.add(m, "news", f"Latest CarWale news (as of {m.get('scraped_at')})", "\n".join(news[:20]))
+
+    # 10. on-road prices per city (per variant + breakup) ------------------------------------
+    for cp in m.get("city_pages") or []:
+        vs = sorted(cp["versions"], key=lambda v: v["on_road"])
+        if not vs:
+            continue
+        lines = [f"On-road prices in {cp['city']} ({len(vs)} variants, as of {m.get('scraped_at')}): "
+                 f"{inr(vs[0]['on_road'])} ({vs[0]['name']}) to {inr(vs[-1]['on_road'])} ({vs[-1]['name']})."]
+        pick = vs if len(vs) <= 14 else vs[:7] + vs[-7:]
+        lines += [f"- {v['name']}: {inr(v['on_road'])} on-road (ex-showroom {inr(v.get('ex_showroom'))})" for v in pick]
+        b = cp.get("breakup")
+        if b:
+            core, alt, extras = [], [], []
+            for c in b["charges"]:
+                n = c["name"]
+                if n.lower().startswith("ex-showroom"):
+                    continue
+                if c["group"] in ("Warranties", "Car Maintenance", "Accessories"):
+                    extras.append(f"{n} {rs(c['value'])}")
+                elif "corporate" in n.lower() or "bharat" in n.lower():
+                    alt.append(f"{n} {rs(c['value'])}")
+                else:
+                    core.append(f"{n} {rs(c['value'])}")
+            lines.append(f"Price breakup in {cp['city']} for {b['version']}: ex-showroom {inr(b['ex_showroom'])}; "
+                         f"{'; '.join(core)}; total on-road {inr(b['on_road'])}.")
+            if alt:
+                lines.append(f"Alternative registration types: {'; '.join(alt)}.")
+            if extras:
+                lines.append(f"Optional packages offered by the dealer: {'; '.join(extras)}.")
+        ch.add(m, "on_road", f"On-road price in {cp['city']}", "\n".join(lines),
+               url=f"{m['url']}price-in-{cp['city'].lower().replace(' ', '-')}/")
+
+    # 11. CarWale's written comparison verdicts with rivals -------------------------------
+    for c in m.get("comparisons") or []:
+        names = [NAMES.get(x, x) for x in c["pair"]]
+        parts = [f"CarWale's verdict: {c['text']}"] if c.get("text") else []
+        parts += [f"CarWale expert's take on the {n}: {t}" for n, t in zip(names, c.get("takes") or []) if t]
+        if c.get("road_tests"):
+            parts.append(f"Related CarWale road tests: {'; '.join(c['road_tests'])}.")
+        ch.add(m, "comparison", f"CarWale comparison: {names[0]} vs {names[1]}", "\n".join(parts), url=c["url"])
+
+
+def rs(v) -> str:
+    """Small rupee amounts in full (₹15,929), large ones in lakh."""
+    if not v:
+        return "n/a"
+    return inr(v) if v >= 1e5 else f"₹{int(v):,}"
+
+
+NAMES: dict[str, str] = {}
+
+
+def best_list_chunks(ch: Chunker) -> None:
+    path = PROCESSED / "best_lists.jsonl"
+    if not path.exists():
+        return
+    for bl in read_jsonl(path):
+        ranked = "\n".join(f"{i}. {r['name']} ({r['price']}" + (f", rated {r['rating']}/5" if r.get("rating") else "") + ")"
+                           for i, r in enumerate(bl["ranked"][:12], 1))
+        body = f"CarWale's list ({len(bl['ranked'])} cars, most popular first):\n{ranked}\n{bl['summary']}"
+        for f in bl["faqs"][:4]:
+            body += f"\nQ: {f['q']}\nA: {f['a']}"
+        ch.add(None, "best_list", bl["title"], body, url=bl["url"], free_prefix="CarWale list", free_key="bestlist")
 
 
 def glossary_chunks(ch: Chunker) -> None:
@@ -324,12 +393,14 @@ def main() -> None:
     by_model = defaultdict(list)
     for v in variants:
         by_model[v["model_id"]].append(v)
+    NAMES.update({m["id"]: m["full_name"] for m in models})
     ch = Chunker()
     for m in models:
         if m["status"] == "discontinued":
             continue
         model_chunks(ch, m, by_model.get(m["id"], []))
     glossary_chunks(ch)
+    best_list_chunks(ch)
     n = write_jsonl(PROCESSED / "chunks.jsonl", ch.rows)
     print(f"wrote {n} chunks")
     print("by section:", dict(Counter(r["section"] for r in ch.rows).most_common()))

@@ -18,7 +18,7 @@ Convert the LATEST user message into the JSON plan. Use CONTEXT to resolve follo
 - prefer_tags (soft, from adjectives): smart/tech-loaded/connected -> connected_car, adas, ota_updates, wireless_carplay, 360_camera; premium -> ventilated_seats, panoramic_sunroof, leather_seats; safe -> adas, 6_airbags, esc; family -> rear_ac_vents; off-road -> 4x4.
 - filter_mode: new (fresh search) | refine (narrow/change the previous list: "only automatics", "make it 15 lakh") | none.
 - sort_by: mileage ("best mileage", "fuel efficient", "economical") | price_asc ("cheapest", "affordable", "lowest price") | price_desc | range (EV range) | power ("powerful", "fast", "sporty") | safety ("safest") | boot_space | rating ("best rated") | relevance (otherwise). The quality being maximised decides the sort, not the budget.
-- aspects from [price, on_road_price, mileage, performance, specs, dimensions, features, safety, comfort, service, reviews, variants, colours].
+- aspects from [price, on_road_price, mileage, performance, specs, dimensions, features, safety, comfort, service, reviews, variants, colours, news].
 - keywords: 3-8 search words. city: Indian city if mentioned else null. clarify: null unless the request cannot be acted on at all.
 
 Examples:

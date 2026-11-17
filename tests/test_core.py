@@ -169,6 +169,18 @@ def test_trim_detection_and_diff():
     assert "HTX has but HTK Plus lacks: ventilated seats" in out and "HTK Plus has but HTX lacks: nothing" in out
 
 
+def test_best_list_only_when_title_matches_filters():
+    from app.rag.schemas import QueryPlan
+    ok = Pipeline._best_list_ok
+    p = QueryPlan(standalone_query="q", intent="recommend")
+    f = p.filters.model_copy(update={"price_max": 1_500_000, "body_types": ["SUV"]})
+    assert ok(p, f, "Best SUVs Under 15 Lakh")
+    assert not ok(p, f, "Best Cars Under 15 Lakh") and not ok(p, f, "Best SUVs Under 10 Lakh")
+    assert not ok(p, p.filters, "Best Cars Under 10 Lakh")  # no stated constraints -> never attach a list
+    f2 = p.filters.model_copy(update={"price_max": 2_000_000, "seats_min": 7})
+    assert ok(p, f2, "Best 7 Seater Cars Under 20 Lakh")
+
+
 def test_split_text_keeps_lines_and_limit():
     from ingestion.build_chunks import split_text
     text = "\n".join(f"Group {i}: " + "; ".join(f"feature {i}-{j}" for j in range(40)) for i in range(6))

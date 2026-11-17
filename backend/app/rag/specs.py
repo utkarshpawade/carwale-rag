@@ -168,9 +168,20 @@ def facts(m: dict, vs: list[dict], aspects: set[str], city: str | None = None, c
         f["Key features (top variant)"] = feature_list(m.get("feature_tags"), 10)
     if every or aspects & {"price", "on_road_price", "variants"}:
         cps = d.get("city_prices") or []
-        if city:
+        page = next((p for p in d.get("city_pages") or [] if norm(p.get("city") or "") == norm(city or "")), None)
+        if city and page and page.get("versions"):
+            ons = sorted(page["versions"], key=lambda v: v["on_road"])
+            f[f"On-road price ({page['city']})"] = (f"{inr(ons[0]['on_road'])} ({ons[0]['name']}) to "
+                                                   f"{inr(ons[-1]['on_road'])} ({ons[-1]['name']}), {len(ons)} variants")
+            b = page.get("breakup")
+            if b:
+                core = [f"{c['name']} {inr(c['value']) if c['value'] >= 1e5 else '₹' + format(int(c['value']), ',')}"
+                        for c in b["charges"] if c["group"] not in ("Warranties", "Car Maintenance", "Accessories")
+                        and "corporate" not in c["name"].lower() and "bharat" not in c["name"].lower()]
+                f[f"On-road breakup ({b['version']})"] = "; ".join(core[:8])
+        elif city:
             hit = next((c for c in cps if norm(c.get("city") or "") == norm(city)), None)
-            f[f"On-road price ({city})"] = f"Rs. {hit['range']}" if hit else f"not listed for {city} (listed cities: {', '.join(c['city'] for c in cps[:8])})"
+            f[f"On-road price ({city})"] = f"Rs. {hit['range']}" if hit else f"not listed for {city} (listed cities: {', '.join(c['city'] for c in cps[:12])})"
         elif aspects & {"on_road_price"} and cps:
             f["On-road prices"] = "; ".join(f"{c['city']} Rs. {c['range']}" for c in cps[:5])
         f["Variants"] = f"{len(vs)} versions" + (f" from {vs[0]['name']} to {vs[-1]['name']}" if vs else "")
@@ -291,6 +302,25 @@ def trim_comparison(name: str, vs: list[dict], a: str, b: str) -> str:
         f"- {b} has but {a} lacks: {lab(B['tags'] - A['tags'])}",
         f"- Both have: {lab(A['tags'] & B['tags'])}",
     ])
+
+
+def city_variant_prices(m: dict, city: str, trims: list[str] | None = None, only: list[dict] | None = None) -> str:
+    """On-road prices in a city for the trims/variants asked about (the city chunk lists only the extremes)."""
+    page = next((p for p in (m.get("data") or {}).get("city_pages") or [] if norm(p.get("city") or "") == norm(city)), None)
+    if not page or not page.get("versions"):
+        return ""
+    rows = page["versions"]
+    label = "all variants"
+    if trims:
+        rows, label = [v for v in rows if v.get("trim") in trims], f"trim {', '.join(trims)}"
+    elif only is not None:
+        names = {v["name"] for v in only}
+        rows, label = [v for v in rows if v["name"] in names] or rows, "the variants asked about"
+    if not rows:
+        return ""
+    rows = sorted(rows, key=lambda v: v["on_road"])[:16]
+    return (f"On-road prices in {page['city']} for {m['full_name']} ({label}, CarWale data):\n" +
+            "\n".join(f"- {v['name']}: {inr(v['on_road'])} on-road (ex-showroom {inr(v.get('ex_showroom'))})" for v in rows))
 
 
 def trim_feature_matrix(name: str, vs: list[dict], per_trim: int = 9) -> str:

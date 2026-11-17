@@ -23,10 +23,10 @@ from . import car_search, specs
 from .context import build_context
 from .entities import CarResolver, is_generic, norm
 from .followups import suggest
-from .hybrid_search import hybrid_search, pinned_chunks, trim_chunks
+from .hybrid_search import hybrid_search, pinned_chunks, titled_chunks, trim_chunks
 from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v8"  # bump when prompts / ranking change
+CACHE_VERSION = "v9"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
@@ -38,21 +38,22 @@ INTENT_SECTIONS = {
     "service": ["service", "expert_article", "owner_reviews", "faq", "pros_cons"],
     "review": ["pros_cons", "expert_opinion", "expert_review", "expert_article", "owner_reviews", "overview"],
     "variant_advice": ["trim", "trim_features", "variants", "pros_cons", "features"],
-    "compare": ["pros_cons", "expert_opinion", "overview", "mileage", "safety"],
+    "compare": ["comparison", "pros_cons", "expert_opinion", "overview", "mileage", "safety"],
 }
 DEFAULT_ASPECTS = {"spec": {"specs"}, "price": {"price", "variants"}, "feature_check": {"features", "variants"},
                    "safety": {"safety"}, "service": {"service", "reviews"}, "review": {"reviews"},
                    "variant_advice": {"variants", "features", "price"}}
 ASPECT_SECTIONS = {"mileage": ["mileage", "expert_article", "owner_reviews"], "safety": ["safety"],
                    "service": ["service", "expert_article"], "features": ["features", "trim_features"],
-                   "reviews": ["owner_reviews", "pros_cons"], "on_road_price": ["city_prices"],
-                   "price": ["variants", "city_prices"], "variants": ["trim", "variants"], "dimensions": ["specs"],
+                   "reviews": ["owner_reviews", "pros_cons"], "on_road_price": ["on_road", "city_prices"],
+                   "price": ["variants", "on_road", "city_prices"], "variants": ["trim", "variants"], "dimensions": ["specs"],
+                   "news": ["news"],
                    "performance": ["specs", "expert_opinion"], "comfort": ["expert_opinion", "features"]}
 
 
 # the dedicated summary chunk always included for an aspect / intent (fetched directly, not ranked)
 ASPECT_PIN = {"mileage": "mileage", "safety": "safety", "service": "service", "on_road_price": "city_prices",
-              "dimensions": "specs", "variants": "variants"}
+              "dimensions": "specs", "variants": "variants", "news": "news"}
 INTENT_PIN = {"safety": "safety", "service": "service", "price": "variants", "variant_advice": "variants"}
 
 
@@ -145,7 +146,26 @@ class Pipeline:
                 if fuels == ["Electric"] and plan.sort_by == "relevance" and "range" in low:
                     plan.sort_by = "range"
                 notes.append(f"Backstop: fuel filter {fuels} taken from the message text.")
+        if re.search(r"\b(news|latest|updates?|facelift|launch(ing|ed)?|recall|price hike|waiting period)\b", low) \
+                and "news" not in plan.aspects:
+            plan.aspects.append("news")
         return notes
+
+    @staticmethod
+    def _best_list_ok(plan: QueryPlan, f: Filters, title: str) -> bool:
+        """Only attach a CarWale 'best ...' list whose title matches every stated constraint (budget, body, fuel...)."""
+        t = (title or "").lower()
+        req = []
+        if f.price_max:
+            req.append(f"under {round(f.price_max / 1e5)} lakh")
+        req += [{"SUV": "suv", "Sedan": "sedan", "Hatchback": "hatchback", "MUV": "muv|mpv"}.get(b, b.lower()) for b in f.body_types]
+        req += [x.lower() for x in f.fuel_types]
+        if f.transmission:
+            req.append(f.transmission.lower())
+        if f.seats_min:
+            req.append(f"{f.seats_min} seater")
+        req += [b.lower() for b in f.brands]
+        return bool(req) and all(any(alt in t for alt in r.split("|")) for r in req)
 
     # ------------------------------------------------------------------------------------------ resolve
     def _targets(self, plan: QueryPlan, st: ConvState) -> tuple[list[str], list[dict], list[str], list[str]]:
@@ -228,10 +248,10 @@ class Pipeline:
                         plan.standalone_query = message
                     break
                 except LLMUnavailable as e:
-                    if e.auth or attempt == 2 or (e.retry_after or 0) > 30:
+                    if e.auth or attempt == 2 or (e.retry_after or 0) > 60:
                         yield Event("error", {"message": self._busy(e)})
                         return
-                    wait = min(max(e.retry_after or 3.0, 1.5), 30.0)
+                    wait = min(max(e.retry_after or 3.0, 1.5), 60.0)
                     yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
                     await asyncio.sleep(wait)
         timer.mark("plan")
@@ -307,6 +327,12 @@ class Pipeline:
                 chunks = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=ids,
                                              sections=["overview", "pros_cons", "expert_opinion", "highlights"],
                                              k=7, per_model_cap=2)
+                # CarWale's own curated list for exactly these filters ("Best SUVs under 15 lakh"), if one exists
+                lists = await hybrid_search(qvec, plan.standalone_query, plan.keywords, sections=["best_list"], k=6)
+                match = next((c for c in lists if self._best_list_ok(plan, f, c["title"])), None)
+                if match:
+                    chunks.insert(0, match)  # first, so the context budget never drops CarWale's own list
+                    trace["best_list"] = match["title"]
                 new_active, new_focus = ids, ids[0]
             new_filters = f.model_dump()
         elif target_ids:
@@ -343,6 +369,12 @@ class Pipeline:
                     blocks.append(specs.facts_block(m["full_name"], m["url"], fs))
                     if len(named) >= 2:
                         blocks.append(specs.trim_comparison(m["full_name"], all_vs, named[0], named[1]))
+                    city = plan.city or st.prefs.get("city")
+                    if city and (plan.intent == "price" or aspects & {"price", "on_road_price"}):
+                        hinted = h and (h.variant_hint or h.fuel_hint or h.transmission_hint)
+                        cvp = specs.city_variant_prices(m, city, named or None, vs if hinted else None)
+                        if cvp:
+                            blocks.append(cvp)
                     wanted = list(dict.fromkeys(plan.filters.feature_tags + specs.detect_features(
                         " ".join([message, plan.standalone_query] + plan.keywords))))
                     if wanted and plan.intent in ("feature_check", "variant_advice", "spec", "price"):
@@ -373,10 +405,23 @@ class Pipeline:
                                              sections=extra or None, k=k_main + k_extra, per_model_cap=cap)
             pins = list(dict.fromkeys([ASPECT_PIN[a] for a in aspects if a in ASPECT_PIN] +
                                       ([INTENT_PIN[plan.intent]] if plan.intent in INTENT_PIN else [])))[:2]
-            pinned = await pinned_chunks(target_ids[:3], pins)
-            for mid, named in named_trims.items():  # trims the user named: their own chunks incl. "adds over" diff
+            # pins in priority order (the context budget is filled front to back):
+            # CarWale's verdict for the exact pair > the trims named > aspect summaries > city on-road prices
+            verdicts, trim_pins, city_pins = [], [], []
+            if compare and len(target_ids) >= 2:
+                for i, a in enumerate(target_ids[:3]):
+                    for b in target_ids[i + 1:3]:
+                        verdicts += (await titled_chunks(a, "comparison", f"vs {self.resolver.name(b)}", 1) or
+                                     await titled_chunks(b, "comparison", f"vs {self.resolver.name(a)}", 1))
+            for mid, named in named_trims.items():
                 if named:
-                    pinned = await trim_chunks(mid, named[:3]) + pinned
+                    trim_pins += await trim_chunks(mid, named[:3])
+            aspect_pins = await pinned_chunks(target_ids[:3], pins)
+            city = plan.city or st.prefs.get("city")
+            if city and (plan.intent == "price" or aspects & {"on_road_price"}):
+                for mid in target_ids[:2]:  # per-variant on-road prices + breakup for that city (Mumbai / Delhi)
+                    city_pins += await titled_chunks(mid, "on_road", city, 1)
+            pinned = verdicts + trim_pins + aspect_pins + city_pins
             pinned_ids = {c["id"] for c in pinned}
             chunks = pinned + [c for c in chunks if c["id"] not in pinned_ids]
             trace["route"] = "compare" if compare else "car_details"
@@ -439,10 +484,10 @@ class Pipeline:
                 if parts:
                     parts.append("\n\n_(answer cut short: the AI service is busy)_")
                     break
-                if e.auth or attempt == 2 or (e.retry_after or 0) > 30:
+                if e.auth or attempt == 2 or (e.retry_after or 0) > 60:
                     yield Event("error", {"message": self._busy(e)})
                     return
-                wait = min(max(e.retry_after or 3.0, 1.5), 30.0)
+                wait = min(max(e.retry_after or 3.0, 1.5), 60.0)
                 yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
                 await asyncio.sleep(wait)
         answer = "".join(parts).strip()

@@ -32,7 +32,7 @@ MODEL_COLS = ["id", "cw_model_id", "brand", "brand_slug", "name", "slug", "full_
               "user_rating_count", "expert_rating_5", "feature_tags", "image_url"]
 # bulky text lives in chunks; keep the structured remainder in models.data
 DATA_DROP = {"owner_reviews", "expert_review", "synopsis", "expert_opinion", "faqs", "upcoming_mentions",
-             "trim_features", "expert_articles"}
+             "trim_features", "expert_articles", "news", "comparisons"}
 VARIANT_COLS = ["version_id", "model_id", "name", "display_name", "trim", "url", "price", "fuel_type", "hybrid_type",
                 "transmission", "is_automatic", "engine_cc", "power_bhp", "torque_nm", "mileage_arai", "mileage_unit",
                 "mileage_owner", "mileage_expected", "mileage_effective", "mileage_basis", "mileage_city_tested", "mileage_highway_tested", "range_km", "battery_kwh",

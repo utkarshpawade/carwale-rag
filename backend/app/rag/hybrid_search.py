@@ -37,6 +37,14 @@ async def pinned_chunks(model_ids: list[str], sections: list[str]) -> list[dict]
         ORDER BY model_id, section, id""", (model_ids, sections))
 
 
+async def titled_chunks(model_id: str, section: str, title_like: str, limit: int = 2) -> list[dict]:
+    """Chunks of one section whose title matches, e.g. the 'X vs Y' verdict or 'On-road price in Mumbai'."""
+    return await fetch("""
+        SELECT id, model_id, section, title, content, url, 1.0::float AS score, ARRAY['pinned'] AS via
+        FROM chunks WHERE model_id = %s AND section = %s AND title ILIKE %s ORDER BY id LIMIT %s""",
+                       (model_id, section, f"%{title_like}%", limit))
+
+
 async def trim_chunks(model_id: str, trims: list[str]) -> list[dict]:
     """The per-trim chunks (versions, key features, CarWale's 'adds over' diff) for trims the user named."""
     if not trims:

@@ -9,6 +9,7 @@ Only robots.txt-allowed paths; already-cached pages are skipped by the fetcher.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import urllib.robotparser
 
@@ -65,10 +66,49 @@ def stage2() -> list[str]:
     return urls
 
 
+CITY_PAGES = ("mumbai", "delhi")
+LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
+
+
+def sitemap(name: str) -> list[str]:
+    xml = httpx.get(f"{BASE}/sitemap/{name}", headers=HEADERS, timeout=60).text
+    return [u for u in LOC_RE.findall(xml) if "/hi/" not in u]
+
+
+def rival_compare_urls(models: list[dict], rivals_per_model: int = 4) -> list[str]:
+    """CarWale comparison pages for each model's own listed alternatives (popular pairs carry written verdicts)."""
+    allm = [json.loads(l) for l in (PROCESSED / "models.jsonl").open(encoding="utf-8")]
+    slug2id = {f"{m['brand_slug']}-{m['slug']}": m["id"] for m in allm}
+    pairs = {}
+    for u in sitemap("cw-compare.xml"):
+        s = u.rstrip("/").split("/")[-1]
+        if "-vs-" in s:
+            a, b = s.split("-vs-", 1)
+            if a in slug2id and b in slug2id:
+                pairs[frozenset((slug2id[a], slug2id[b]))] = u
+    launched = {m["id"] for m in models}
+    out = []
+    for m in sorted(models, key=lambda m: -(m.get("user_rating_count") or 0)):
+        for r in (m.get("similar") or [])[:rivals_per_model]:
+            key = frozenset((m["id"], r))
+            if r in launched and key in pairs and pairs[key] not in out:
+                out.append(pairs[key])
+    return out
+
+
+def stage3() -> list[str]:
+    models = launched_models()
+    urls = [f"{m['url']}price-in-{c}/" for m in models for c in CITY_PAGES]  # per-variant on-road breakup
+    urls += [f"{m['url']}news/" for m in models]                              # latest headlines
+    urls += sitemap("cw-long-tail.xml")                                       # CarWale "best cars ..." lists
+    urls += rival_compare_urls(models)                                        # rival comparisons
+    return urls
+
+
 def main() -> None:
     stage = sys.argv[1] if len(sys.argv) > 1 else "1"
     rp = robots()
-    urls = stage1() if stage == "1" else stage2()
+    urls = {"1": stage1, "2": stage2, "3": stage3}[stage]()
     urls = [u for u in dict.fromkeys(urls) if rp.can_fetch(HEADERS["User-Agent"], u)]
     out = DATA / f"urls_stage{stage}.json"
     out.write_text(json.dumps(urls, indent=1), encoding="utf-8")

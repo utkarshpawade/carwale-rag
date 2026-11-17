@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     max_input_chars: int = 1000
 
     # token budgets
-    context_token_budget: int = 1800
+    context_token_budget: int = 2200
     answer_max_tokens: int = 1000
     planner_max_tokens: int = 700
     history_turns: int = 3
