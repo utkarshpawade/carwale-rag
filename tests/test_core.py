@@ -221,8 +221,12 @@ def test_planner_cannot_swap_in_an_unnamed_car(resolver):
                                for m in mentions])
 
     pl = plan("Mahindra Thar")  # qwen's misreading of the typo
+    pl.standalone_query, pl.keywords = "What is the price of the Mahindra Thar in Delhi?", ["Thar", "price", "Delhi"]
     assert p._ground_cars(pl, "fortuneer price in delhi") and [c.mention for c in pl.cars] == ["Toyota Fortuner"]
     assert pl.cars[0].variant_hint is None  # hint not in the message -> dropped
+    # the answer model reads the rewritten question, so the wrong car must leave it (live bug: "no Thar price listed")
+    assert "Thar" not in pl.standalone_query and "Toyota Fortuner" in pl.standalone_query
+    assert pl.keywords == ["price", "Delhi"]
     pl = plan("Mahindra Thar", fuel="Diesel")
     p._ground_cars(pl, "fortuneer diesel price")
     assert pl.cars[0].fuel_hint == "Diesel"  # hint the user typed is kept

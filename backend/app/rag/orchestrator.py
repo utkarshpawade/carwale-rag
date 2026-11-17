@@ -26,7 +26,7 @@ from .followups import suggest
 from .hybrid_search import brand_chunks, hybrid_search, pinned_chunks, titled_chunks, trim_chunks
 from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v11"  # bump when prompts / ranking change
+CACHE_VERSION = "v12"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
@@ -167,7 +167,12 @@ class Pipeline:
         plan.cars = [CarRef(mention=self.resolver.name(m), variant_hint=keep(first.variant_hint),
                             fuel_hint=keep(first.fuel_hint), transmission_hint=keep(first.transmission_hint))
                      for m in named]
-        return [f"Backstop: the message names {', '.join(self.resolver.name(m) for m in named)}, not {old}."]
+        # the planner's rewrite names the wrong car too, and the answer model reads it: rebuild it from the user's words
+        names = [self.resolver.name(m) for m in named]
+        plan.standalone_query = f"{message.strip()} ({', '.join(names)})"
+        wrong = set(norm(old).split()) - {w for n in names for w in norm(n).split()}
+        plan.keywords = [k for k in plan.keywords if not set(norm(k).split()) & wrong]
+        return [f"Backstop: the message names {', '.join(names)}, not {old}."]
 
     def _backstops(self, plan: QueryPlan, message: str) -> list[str]:
         """Deterministic guards for the few plan mistakes the eval exposed (LLM output is still the primary plan)."""
