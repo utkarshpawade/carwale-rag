@@ -171,10 +171,12 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
 - **Demo the fallback chain:** set `FORCE_FAIL_MODELS=openai/gpt-oss-120b`.
 
 ## Evaluation results
-`python eval/run_eval.py` (dry run: planner + routing + retrieval) on 25 single-turn and 7 multi-turn cases gives
-**32/32 passed**, with planner + retrieval latency of **p50 ~0.9–1.0 s**. One case was a free-tier rate-limit miss during a fast back-to-back run and passed on re-run.
+`python eval/run_eval.py` (dry run with the real planner: planning, routing and retrieval) on 36 single-turn cases and
+7 multi-turn turns gives **43/43 passed**, with planner + retrieval latency of **p50 881 ms, p95 1,147 ms** (18 Nov 2026).
+The run before the grounding fix scored 37/38: the miss was "fortuneer price in delhi" planned as the Mahindra Thar.
 
-The new cases cover variant diffs, which variants have a feature, long-term service experience, owner complaints and real-world mileage.
+Recent cases cover variant diffs, which variants have a feature, long-term service experience, owner complaints,
+real-world mileage, city on-road prices, CarWale's comparisons and lists, news, colours, offers and discontinued models.
 
 The cases cover every intent; typos, renames and Hinglish ("fortuneer", "xuv700", "brezza ka mileage kitna hai"); structured searches with numeric and feature filters; references to earlier turns ("which one", "its", "the second one"); and refinement ("only 7 seaters").
 
