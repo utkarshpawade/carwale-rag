@@ -105,10 +105,47 @@ def stage3() -> list[str]:
     return urls
 
 
+CITY_PAGES_MORE = ("bangalore", "hyderabad", "pune", "chennai", "kolkata", "ahmedabad", "jaipur", "lucknow",
+                   "chandigarh", "kochi")
+NEWS_ARTICLES_PER_MODEL = 5
+
+
+def stage4() -> list[str]:
+    """Brand pages, current OEM offers, 10 more cities' per-variant on-road prices, recent news article bodies.
+    Ordered so an interrupted crawl still leaves whole data types (every model for a city) behind."""
+    models = launched_models()
+    urls = sitemap("cw-make.xml")                                                    # brand overview, FAQs, discontinued
+    urls += [f"{m['url']}offers/" for m in models]                                   # OEM offers (city default Mumbai)
+    urls += [f"{m['url']}price-in-{c}/" for c in CITY_PAGES_MORE for m in models]    # city-major order
+    for m in sorted(models, key=lambda m: -(m.get("user_rating_count") or 0)):
+        urls += [n["url"] for n in (m.get("news") or [])[:NEWS_ARTICLES_PER_MODEL] if n.get("url")]
+    return urls
+
+
+CITY_PAGES_TIER2 = ("gurgaon", "noida", "thane", "navi-mumbai", "indore", "nagpur", "surat", "coimbatore")
+MAX_REVIEW_PAGES_DEEP = 8
+NEWS_ARTICLES_DEEP = 10
+
+
+def stage5() -> list[str]:
+    """Deeper owner-review pages for popular models (4-8), news articles 6-10, eight tier-2 cities."""
+    models = sorted(launched_models(), key=lambda m: -(m.get("user_rating_count") or 0))
+    urls = []
+    for m in models:
+        n = m.get("user_review_count") or 0
+        if n > 10 * MAX_REVIEW_PAGES:
+            pages = min(MAX_REVIEW_PAGES_DEEP, -(-n // 10))
+            urls += [f"{m['url']}reviews/page/{p}/" for p in range(MAX_REVIEW_PAGES + 1, pages + 1)]
+    for m in models:
+        urls += [x["url"] for x in (m.get("news") or [])[NEWS_ARTICLES_PER_MODEL:NEWS_ARTICLES_DEEP] if x.get("url")]
+    urls += [f"{m['url']}price-in-{c}/" for c in CITY_PAGES_TIER2 for m in models]
+    return urls
+
+
 def main() -> None:
     stage = sys.argv[1] if len(sys.argv) > 1 else "1"
     rp = robots()
-    urls = {"1": stage1, "2": stage2, "3": stage3}[stage]()
+    urls = {"1": stage1, "2": stage2, "3": stage3, "4": stage4, "5": stage5}[stage]()
     urls = [u for u in dict.fromkeys(urls) if rp.can_fetch(HEADERS["User-Agent"], u)]
     out = DATA / f"urls_stage{stage}.json"
     out.write_text(json.dumps(urls, indent=1), encoding="utf-8")

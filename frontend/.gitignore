@@ -1,3 +1,9 @@
 .vercel
 .env*
 !.env.example
+
+# test output
+e2e-dist
+test-results
+playwright-report
+coverage

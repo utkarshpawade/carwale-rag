@@ -29,6 +29,7 @@ MANUAL_ALIASES = {
     "g wagon": "mercedes-benz/g-class", "g wagen": "mercedes-benz/g-class",
 }
 FILLER = {"new", "the", "car", "cars", "model", "latest", "2025", "2026", "2027", "suv", "india", "price", "a"}
+UPCOMING_CUES = ("upcoming", "facelift", "next", "nextgen")  # rank the upcoming model of a shared alias first
 # a mention made only of these words is a modifier of an earlier car ("EV version", "the diesel one"), not a car name
 GENERIC_MENTION = FILLER | {"ev", "electric", "version", "variant", "variants", "petrol", "diesel", "cng", "hybrid",
                             "automatic", "manual", "amt", "cvt", "dct", "top", "base", "one", "same", "its", "it",
@@ -86,6 +87,11 @@ class CarResolver:
             if a in self.strong:
                 del self.weak[a]
         self.keys = list(self.strong) + list(self.weak)
+        # one-word strong aliases by first letter, for the typo-tolerant text scan ("fortuneer", "cretta")
+        self.one_word: dict[str, list[str]] = {}
+        for a in self.strong:
+            if " " not in a and len(a) >= 5 and a not in COMMON_WORD_MODELS and a not in self.brand_words:
+                self.one_word.setdefault(a[0], []).append(a)
 
     @staticmethod
     def _strong_aliases(m: dict) -> set[str]:
@@ -130,7 +136,7 @@ class CarResolver:
         q_full = norm(mention)
         if not q_full or is_generic(q_full):
             return []
-        prefer_upcoming = any(w in q_full.split() for w in ("upcoming", "facelift", "next", "nextgen"))
+        prefer_upcoming = any(w in q_full.split() for w in UPCOMING_CUES)
         strip = lambda s: " ".join(w for w in s.split() if w not in FILLER)  # noqa: E731
         brand_slug, rest = None, q_full
         for bw, bs in sorted(self.brand_words.items(), key=lambda kv: -len(kv[0])):
@@ -140,6 +146,9 @@ class CarResolver:
         if brand_slug and not strip(rest):
             return []  # brand only, not a model
         cands = list(dict.fromkeys(c for c in (q_full, strip(q_full), rest, strip(rest)) if c))
+        if prefer_upcoming:  # "upcoming urban cruiser": after the full mention, also try it without the cue words
+            uncued = (" ".join(w for w in c.split() if w not in UPCOMING_CUES) for c in cands)
+            cands += [c for c in dict.fromkeys(uncued) if c and c not in cands]
         for c in cands:  # exact alias hits: full mention first, so 'model y' is not reduced to 'y'
             for table, score in ((self.strong, 100.0), (self.weak, 95.0)):
                 ids = table.get(c)
@@ -156,13 +165,18 @@ class CarResolver:
         if not hits:
             return []
         best: dict[str, tuple[float, str]] = {}
+        q_tokens = set(q_full.split())  # unstripped: "EQS SUV" keeps "suv", so the EQS SUV still wins
         for alias, score, _ in hits:
             if not set(alias.split()) - GENERIC_MENTION and alias not in self.strong:
                 continue  # never match on generic tokens alone
+            # alias words the user did not type count against it: token_set_ratio scores 'hyundai creta electric'
+            # as high as 'hyundai creta' for "creta hyundai", and the length bonus then picked the wrong sibling
+            extra = sum(1 for t in set(alias.split())  # a typo still counts as typed ("taisorx" ~ "taisor")
+                        if t not in q_tokens and not any(fuzz.ratio(t, qt) >= 80 for qt in q_tokens))
             for mid in self.strong.get(alias, set()) | self.weak.get(alias, set()):
                 if brand_slug and self.models[mid]["brand_slug"] != brand_slug:
                     continue
-                adj = score - (3 if alias in self.weak else 0) + min(len(alias), 20) * 0.05
+                adj = score - (3 if alias in self.weak else 0) + min(len(alias), 20) * 0.05 - 2.0 * extra
                 if mid not in best or adj > best[mid][0]:
                     best[mid] = (adj, alias)
         if not best:
@@ -194,8 +208,36 @@ class CarResolver:
                     used[i:i + n] = [True] * n
         return found[:limit]
 
+    def find_fuzzy_in_text(self, text: str, limit: int = 3) -> list[str]:
+        """find_in_text plus typo tolerance: words of 5+ letters scored (ratio >= 88) against one-word strong aliases
+        with the same first letter. Used only to check car names the planner proposes against what the user typed."""
+        found = self.find_in_text(text, limit)
+        if found:
+            return found
+        for tok in norm(text).split():
+            if len(tok) < 5 or is_generic(tok) or tok in self.brand_words or tok in COMMON_WORD_MODELS:
+                continue
+            hit = process.extractOne(tok, self.one_word.get(tok[0], []), scorer=fuzz.ratio, score_cutoff=88)
+            if hit:
+                best = self._rank(self.strong[hit[0]], hit[1], hit[0], False)[0].model_id
+                if best not in found:
+                    found.append(best)
+        return found[:limit]
+
     def brand_slug(self, text: str) -> str | None:
         return self.brand_words.get(norm(text))
+
+    def brands_in_text(self, text: str) -> list[str]:
+        """Brand slugs named in free text ('which hyundai cars are discontinued' -> ['hyundai']). Brand words that
+        are everyday words ('mini', 'force') are skipped here."""
+        toks, out = norm(text).split(), []
+        for n in (3, 2, 1):
+            for i in range(len(toks) - n + 1):
+                gram = " ".join(toks[i:i + n])
+                slug = self.brand_words.get(gram)
+                if slug and gram not in {"mini", "force"} and slug not in out:
+                    out.append(slug)
+        return out
 
     def name(self, mid: str) -> str:
         m = self.models.get(mid)

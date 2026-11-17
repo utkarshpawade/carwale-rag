@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ..memory import store
 from ..rag.followups import STARTERS
@@ -63,9 +63,14 @@ async def delete_conversation(conv_id: str, user_id: str):
 
 
 class FeedbackIn(BaseModel):
-    message_id: int
+    message_id: int = Field(ge=1, le=2**63 - 1)  # a BIGSERIAL id; anything else used to fail in Postgres with a 500
     rating: int = Field(ge=-1, le=1)
     comment: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("comment")
+    @classmethod
+    def _no_nul(cls, v: str | None) -> str | None:
+        return v.replace("\x00", "") if v else v  # PostgreSQL TEXT cannot store NUL bytes
 
 
 @router.post("/api/feedback")

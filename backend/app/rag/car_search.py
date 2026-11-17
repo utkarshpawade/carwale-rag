@@ -163,7 +163,10 @@ async def search_upcoming(f: Filters, brand_slugs: list[str], limit: int = 8) ->
     if brand_slugs:
         where.append("brand_slug = ANY(%(brands)s)"); p["brands"] = brand_slugs
     if f.fuel_types:
-        where.append("(fuel_types && %(fuels)s OR is_ev = %(ev)s)"); p["fuels"] = list(f.fuel_types); p["ev"] = "Electric" in f.fuel_types
+        # an EV flag only widens an Electric search; "is_ev = false" used to admit every non-EV for any fuel
+        where.append("(fuel_types && %(fuels)s OR (%(ev)s AND is_ev IS TRUE))")
+        p["fuels"] = list(f.fuel_types)
+        p["ev"] = "Electric" in f.fuel_types
     return await fetch(f"""SELECT id, full_name, brand, body_type_raw, url, image_url, price_min, price_max,
                                price_is_estimate, launched_on, fuel_types, status, user_rating, user_rating_count
                            FROM models WHERE {' AND '.join(where)}

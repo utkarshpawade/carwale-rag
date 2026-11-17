@@ -5,15 +5,17 @@ Ask anything about new cars in India: prices, mileage, specs, features, safety, 
 conversation, so follow-ups such as *"which one has the best mileage?"*, *"what about its safety?"* and
 *"only 7 seaters"* just work.
 
-- **Data:** about 4,300 pages crawled politely from carwale.com, giving 25,200 retrieval chunks. They cover:
+- **Data:** about 8,500 pages crawled politely from carwale.com, giving 31,947 retrieval chunks. They cover:
   - 400 models (288 on sale, 112 upcoming) and 2,283 variants
   - 912 trim feature trees
   - 4,458 owner reviews and 390 expert articles, including 54 long-term reports
-  - per-variant on-road prices for Mumbai and Delhi, with city coverage of about 28 cities per model
-  - 3,481 news headlines
+  - per-variant on-road prices with the full breakup for 12 cities, and on-road ranges for about 85 cities per model
+  - 3,481 news headlines and 1,532 news article bodies
   - 596 rival-pair comparisons
   - 306 of CarWale's "best cars" lists
-- **Stack:** FastAPI · Groq (gpt-oss-120b / gpt-oss-20b / Llama 3.x) · Postgres + pgvector (Neon) · fastembed (bge-small, ONNX) · React + Vite + Tailwind
+  - 41 brand pages (overview, FAQs, 495 discontinued models)
+  - this month's manufacturer offers (56 models) and paint colours (all 288 on-sale models)
+- **Stack:** FastAPI · Groq (gpt-oss-120b / gpt-oss-20b / qwen3.8-27b) · Postgres + pgvector (Neon) · fastembed (bge-small, ONNX) · React + Vite + Tailwind
 - **Live:** app **https://carwale-rag.vercel.app** · API **https://carwale-rag-api.onrender.com** ([health](https://carwale-rag-api.onrender.com/api/health), [docs](https://carwale-rag-api.onrender.com/docs)). The free Render instance sleeps when idle; the first request wakes it in about a minute.
 
 ---
@@ -99,8 +101,14 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
   - **CarWale's "best cars" lists (306):** ranked picks by budget, body type, fuel, gearbox, seats and brand. One is attached only when its title matches every filter in the question.
   - **Rival comparison pages (596 pairs):** CarWale's expert take on each car, plus a written verdict for popular pairs such as Creta vs Seltos. Templated boilerplate is dropped.
   - **Checked and not usable:** the service-cost fields on the city and compare pages are present but empty, which confirms CarWale publishes no service costs.
+- **Fourth pass (`discover_more 4`):** about 4,260 more pages:
+  - **City price pages for 10 more cities** (Bangalore, Hyderabad, Pune, Chennai, Kolkata, Ahmedabad, Jaipur, Lucknow, Chandigarh, Kochi), so 12 cities now have per-variant on-road prices. Their city FAQs only restate those prices, so only Mumbai's and Delhi's are kept.
+  - **Offers pages:** the manufacturer's offer of the month with its validity (56 models have one), quoted with the city CarWale showed it for.
+  - **Brand pages (41):** brand overview, key highlights, FAQs and the list of discontinued models.
+  - **News article bodies:** the five most recent articles per model (1,532), with their publish dates.
+  - Colours were already on the model pages; they now get their own chunk.
 - **Captured per model:**
-  - prices (ex-showroom per version, plus on-road prices in 8 cities)
+  - prices: ex-showroom per version, on-road ranges for about 85 cities, and per-variant on-road prices with the full breakup for 12 cities
   - full specs and features
   - ARAI, CarWale-tested and owner-reported mileage
   - EV range, battery and charging
@@ -123,7 +131,7 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
   | Boot space | 73% |
   | Mileage, petrol/diesel/CNG (ARAI 47%, plus expected/owner figures = 74%) | 74% |
   | EV range | 94% |
-  | NCAP | 55% (many cars were never crash-tested) |
+  | NCAP | 55% (of 176 launched models without a rating, CarWale marks 125 "Not Tested" and lists nothing for 51; answers keep these two cases apart) |
 
 - **Known gap:** CarWale doesn't publish a scheduled service-cost table. Service answers therefore use warranty, owners'
   after-sales ratings and CarWale's long-term service reports (where they exist), and say plainly what isn't available.
@@ -131,11 +139,20 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
 
 ### Retrieval refinements
 - **Two-tier retrieval:** each intent's core sections get 4 slots and aspect extras (long-term reports, owner reviews) get 2, so plentiful review text can't crowd out the core facts.
-- **Pinned chunks:** the dedicated summary chunk for the aspect asked about (mileage, safety, service, prices) is always included, fetched directly rather than ranked.
+- **Pinned chunks:** some chunks are fetched directly rather than ranked, in this priority order:
+  1. CarWale's verdict for the pair being compared
+  2. the trims named in the question
+  3. the summary chunk for the aspect asked about (mileage, safety, service, prices, news)
+  4. the city on-road table
+
+  For recommendations, a matching CarWale "best cars" list goes first.
 - **Deterministic backstops** for the few plan mistakes the eval exposed:
   - a message that names a catalog car is never treated as out of scope;
   - explicit fuel words ("electric", "diesel") become filters if the planner missed them;
-  - "its EV version" resolves through memory to the EV model.
+  - "its EV version" resolves through memory to the EV model;
+  - the planner can't swap in a car the user never typed: qwen read "fortuneer price in delhi" as the Mahindra Thar in 2 of 3 runs, so a typo-tolerant scan of the message now overrules it (sibling models such as Punch and Punch EV still count as a match);
+  - city names map to CarWale's spelling ("Bengaluru" → Bangalore), and a city named in the message is used even if the planner dropped it;
+  - colour, offer and "discontinued" questions are recognised from the message, and a brand-only question ("Which Hyundai cars are discontinued?") gets that brand's CarWale page.
 
 ## Groq free-tier strategy
 - **Models:** this free-tier key can access only `gpt-oss-120b`, `gpt-oss-20b` and `qwen3.8-27b`; the Llama models are not available (checked via `/models`). Each model has its own limits, read from the response headers: 8K tokens per minute and 1K requests per day.
@@ -200,10 +217,16 @@ A full answer takes about 2–3 seconds end to end, with the first token after ~
    ```
 6. Run the tests and the eval:
    ```bash
-   python -m pytest tests -q
-   python eval/run_eval.py            # dry run: planner + retrieval accuracy
+   python -m pytest tests -q --ignore=tests/integration   # 533 unit tests, no database needed
+   python -m pytest tests/integration -q                  # 101 API/DB tests on the carwale_test database, fake Groq server
+   cd frontend && npm test && npm run e2e && cd ..        # 66 React unit tests, 44 Playwright end-to-end tests
+   python eval/run_eval.py            # dry run with the real planner: plan, routing and retrieval accuracy
    python eval/run_eval.py --answers  # full answers with fact checks
    ```
+   On Windows, run the frontend tests from a path with an uppercase drive letter (`D:\...`): with a lowercase `d:\`
+   Node loads vitest twice and every suite fails with "Vitest failed to find the current suite".
+   `TESTING_REPORT.md` covers the full testing pass: what was tested, the 25 bugs found (22 fixed) and the open
+   security items.
 
 ## Deploy (all free tiers)
 1. **Neon:** create a project in AWS Singapore. Then load the catalog, reusing the local vectors instead of recomputing them:

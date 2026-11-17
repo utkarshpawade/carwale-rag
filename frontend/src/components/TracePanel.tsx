@@ -100,11 +100,11 @@ export default function TracePanel({ trace, onClose }: { trace: Trace; onClose: 
               </tbody>
             </table>
           )}
-          {trace.context_tokens_est && <div className="text-slate-400">Context ≈ {trace.context_tokens_est} tokens</div>}
+          {trace.context_tokens_est > 0 && <div className="text-slate-400">Context ≈ {trace.context_tokens_est} tokens</div>}
         </Step>
 
         <Step n={5} title="Generate answer (LLM #2, streamed)" meta={answer ? `${answer.model} · ${answer.prompt_tokens + answer.completion_tokens} tok` : undefined}>
-          {t.first_token && <div>Time to first token: <Badge>{t.first_token} ms</Badge> Total: <Badge>{t.total} ms</Badge></div>}
+          {t.first_token > 0 && <div>Time to first token: <Badge>{t.first_token} ms</Badge> Total: <Badge>{t.total} ms</Badge></div>}
           {(answer?.fallbacks?.length ?? 0) > 1 && <div className="text-amber-700">Fallback chain used: {answer!.fallbacks.join(" → ")}</div>}
           <div className="text-slate-400">Grounded on CAR DATA + numbered sources; memory updated afterwards.</div>
         </Step>

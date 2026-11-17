@@ -23,10 +23,10 @@ from . import car_search, specs
 from .context import build_context
 from .entities import CarResolver, is_generic, norm
 from .followups import suggest
-from .hybrid_search import hybrid_search, pinned_chunks, titled_chunks, trim_chunks
+from .hybrid_search import brand_chunks, hybrid_search, pinned_chunks, titled_chunks, trim_chunks
 from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v10"  # bump when prompts / ranking change
+CACHE_VERSION = "v11"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
@@ -47,13 +47,43 @@ ASPECT_SECTIONS = {"mileage": ["mileage", "expert_article", "owner_reviews"], "s
                    "service": ["service", "expert_article"], "features": ["features", "trim_features"],
                    "reviews": ["owner_reviews", "pros_cons"], "on_road_price": ["on_road", "city_prices"],
                    "price": ["variants", "on_road", "city_prices"], "variants": ["trim", "variants"], "dimensions": ["specs"],
-                   "news": ["news"],
+                   "news": ["news", "news_article"], "colours": ["colours"], "offers": ["offers"],
                    "performance": ["specs", "expert_opinion"], "comfort": ["expert_opinion", "features"]}
 
 
 # the dedicated summary chunk always included for an aspect / intent (fetched directly, not ranked)
 ASPECT_PIN = {"mileage": "mileage", "safety": "safety", "service": "service", "on_road_price": "city_prices",
-              "dimensions": "specs", "variants": "variants", "news": "news"}
+              "dimensions": "specs", "variants": "variants", "news": "news", "colours": "colours", "offers": "offers"}
+
+# aspects the planner has no word for, read off the message itself
+COLOUR_RE = re.compile(r"\b(colou?rs?|shades?|paint (options?|shades?)|dual[- ]tone)\b", re.I)
+OFFER_RE = re.compile(r"\b(discounts?|deals?|cash ?back|exchange bonus|(any|current|latest|best|festive|year[- ]end|"
+                      r"this month'?s?|november|december)\s+offers?|offers?\s+(on|for|available))\b", re.I)
+DISCONTINUED_RE = re.compile(r"\b(discontinu\w*|no longer (sold|available|on sale|made)|stopped (making|selling))\b", re.I)
+
+# cities with per-variant on-road pages, plus other common ones; aliases map to CarWale's spelling
+CITY_ALIASES = {"bengaluru": "Bangalore", "gurugram": "Gurgaon", "new delhi": "Delhi", "bombay": "Mumbai",
+                "madras": "Chennai", "calcutta": "Kolkata", "cochin": "Kochi", "ernakulam": "Kochi", "poona": "Pune",
+                "mysuru": "Mysore", "vizag": "Visakhapatnam", "trivandrum": "Thiruvananthapuram",
+                "pimpri chinchwad": "Pimpri-Chinchwad"}
+KNOWN_CITIES = ["Navi Mumbai", "Greater Noida", "Mumbai", "Delhi", "Bangalore", "Hyderabad", "Pune", "Chennai", "Kolkata",
+                "Ahmedabad", "Jaipur", "Lucknow", "Chandigarh", "Kochi", "Thane", "Noida", "Gurgaon", "Ghaziabad",
+                "Faridabad", "Surat", "Nashik", "Nagpur", "Indore", "Bhopal", "Patna", "Ranchi", "Bhubaneswar",
+                "Guwahati", "Dehradun", "Ludhiana", "Amritsar", "Vadodara", "Rajkot", "Coimbatore", "Visakhapatnam",
+                "Mysore", "Mangalore", "Kanpur", "Varanasi", "Agra", "Raipur", "Thiruvananthapuram", "Aurangabad",
+                "Kolhapur", "Meerut", "Panvel", "Mohali", "Zirakpur", "Hosur", "Secunderabad"]
+CITY_RE = re.compile(r"\b(" + "|".join(sorted([c.lower() for c in KNOWN_CITIES] + list(CITY_ALIASES), key=len, reverse=True))
+                     + r")\b", re.I)
+
+
+def canon_city(name: str | None) -> str | None:
+    """'bengaluru' -> 'Bangalore', 'new delhi' -> 'Delhi', 'pune' -> 'Pune' (CarWale's spelling, used in chunk titles)."""
+    if not name:
+        return None
+    key = re.sub(r"[\s-]+", " ", name.strip().lower())
+    if key in CITY_ALIASES:
+        return CITY_ALIASES[key]
+    return next((c for c in KNOWN_CITIES if c.lower() == key), name.strip().title())
 INTENT_PIN = {"safety": "safety", "service": "service", "price": "variants", "variant_advice": "variants"}
 
 
@@ -111,11 +141,40 @@ class Pipeline:
     FUEL_WORDS = {"electric": "Electric", "ev": "Electric", "evs": "Electric", "diesel": "Diesel", "petrol": "Petrol",
                   "cng": "CNG", "hybrid": "Hybrid", "hybrids": "Hybrid"}
 
+    @staticmethod
+    def _same_family(a: str, b: str) -> bool:
+        """'tata/punch' ~ 'tata/punch-ev', 'mahindra/scorpio' ~ 'mahindra/scorpio-n'."""
+        return a == b or a.startswith(b + "-") or b.startswith(a + "-")
+
+    def _ground_cars(self, plan: QueryPlan, message: str) -> list[str]:
+        """The planner may not swap in a car the user never typed: qwen read 'fortuneer price in delhi' as the Mahindra
+        Thar in 2 of 3 runs. If the message names cars (typos allowed) and none of the planned cars is one of them
+        (or a sibling model), use the message's cars; keep a hint only when its words appear in the message."""
+        if not plan.cars or plan.intent not in CAR_INTENTS | {"general"}:
+            return []
+        named = self.resolver.find_fuzzy_in_text(message)
+        if not named:
+            return []
+        planned = {r.model_id for c in plan.cars for r in self.resolver.resolve(c.mention)[:4]}
+        if any(self._same_family(p, n) for p in planned for n in named):
+            return []
+        old, msg = ", ".join(c.mention for c in plan.cars), norm(message)
+        first = plan.cars[0]
+
+        def keep(h: str | None) -> str | None:
+            return h if h and norm(h) and norm(h) in msg else None
+
+        plan.cars = [CarRef(mention=self.resolver.name(m), variant_hint=keep(first.variant_hint),
+                            fuel_hint=keep(first.fuel_hint), transmission_hint=keep(first.transmission_hint))
+                     for m in named]
+        return [f"Backstop: the message names {', '.join(self.resolver.name(m) for m in named)}, not {old}."]
+
     def _backstops(self, plan: QueryPlan, message: str) -> list[str]:
         """Deterministic guards for the few plan mistakes the eval exposed (LLM output is still the primary plan)."""
         notes = []
         found = self.resolver.find_in_text(message)
         low = message.lower()
+        notes += self._ground_cars(plan, message)
         if plan.intent in ("out_of_scope", "chitchat") and found and not SMALLTALK.match(message):
             plan.intent = ("service" if re.search(r"servic|mainten|warranty|ownership cost", low) else
                            "spec" if re.search(r"mileage|range|boot|engine|power|spec|dimension", low) else "review")
@@ -149,6 +208,18 @@ class Pipeline:
         if re.search(r"\b(news|latest|updates?|facelift|launch(ing|ed)?|recall|price hike|waiting period)\b", low) \
                 and "news" not in plan.aspects:
             plan.aspects.append("news")
+        for rx, aspect in ((COLOUR_RE, "colours"), (OFFER_RE, "offers")):
+            if rx.search(message) and aspect not in plan.aspects:
+                plan.aspects.append(aspect)
+        if plan.city:
+            plan.city = canon_city(plan.city)
+        elif (mc := CITY_RE.search(message)):
+            plan.city = canon_city(mc.group(1))
+            notes.append(f"Backstop: city {plan.city} taken from the message text.")
+        if DISCONTINUED_RE.search(message) and not plan.cars and plan.refers_to == "none" \
+                and plan.intent in ("recommend", "general", "spec", "review") and self.resolver.brands_in_text(message):
+            plan.intent, plan.filters = "general", empty_filters()
+            notes.append("Backstop: a brand's discontinued models -> CarWale's brand page.")
         return notes
 
     @staticmethod
@@ -252,7 +323,7 @@ class Pipeline:
                         yield Event("error", {"message": self._busy(e)})
                         return
                     wait = min(max(e.retry_after or 3.0, 1.5), 60.0)
-                    yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
+                    yield Event("status", {"text": self._retry_text(e, wait)})
                     await asyncio.sleep(wait)
         timer.mark("plan")
         backstops = self._backstops(plan, message)
@@ -389,6 +460,9 @@ class Pipeline:
             # two-tier retrieval: core sections for this intent get most slots; aspect extras (long-term
             # reports, owner reviews) get the rest, so plentiful review text cannot crowd out the core facts
             primary = list(dict.fromkeys(INTENT_SECTIONS.get(plan.intent, [])))
+            if aspects & {"offers", "colours"} and aspects <= {"offers", "colours", "price", "variants", "news"}:
+                # "any offers on the Creta?" / "Seltos colours": the generic price sections (city FAQs) only distract
+                primary = [s for a in ("offers", "colours") if a in aspects for s in ASPECT_SECTIONS[a]] + ["overview", "news"]
             extra = [s for s in dict.fromkeys(s for a in aspects for s in ASPECT_SECTIONS.get(a, [])) if s not in primary]
             k_main, k_extra = (6, 2) if compare else (4, 2)
             cap = 3 if compare else None
@@ -439,6 +513,12 @@ class Pipeline:
             rest = await hybrid_search(qvec, plan.standalone_query, plan.keywords, k=6)
             seen = {c["id"] for c in gl}
             chunks = gl + [c for c in rest if c["id"] not in seen][: 6 - len(gl)]
+            brands = self.resolver.brands_in_text(message)
+            if brands:  # "which Hyundai cars are discontinued?": CarWale's brand page first
+                bc = await brand_chunks(brands[0], qvec, 2)
+                have = {c["id"] for c in bc}
+                chunks = bc + [c for c in chunks if c["id"] not in have]
+                trace["brand"] = brands[0]
         timer.mark("retrieve")
 
         context, sources = build_context(blocks, chunks, self.s.context_token_budget)
@@ -472,6 +552,7 @@ class Pipeline:
         msgs.append({"role": "user", "content": f"{context}\n\n## QUESTION\n{q}"})
         answer_info = CallInfo("answer")
         parts: list[str] = []
+        cut_short = False
         for attempt in range(3):
             try:
                 async for delta in self.llm.stream("answer", msgs, self.s.answer_max_tokens, answer_info):
@@ -483,12 +564,13 @@ class Pipeline:
             except LLMUnavailable as e:
                 if parts:
                     parts.append("\n\n_(answer cut short: the AI service is busy)_")
+                    cut_short = True
                     break
                 if e.auth or attempt == 2 or (e.retry_after or 0) > 60:
                     yield Event("error", {"message": self._busy(e)})
                     return
                 wait = min(max(e.retry_after or 3.0, 1.5), 60.0)
-                yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
+                yield Event("status", {"text": self._retry_text(e, wait)})
                 await asyncio.sleep(wait)
         answer = "".join(parts).strip()
         timer.mark("total")
@@ -510,7 +592,7 @@ class Pipeline:
                 "digest": digest}
         msg_id = await store.add_message(conv_id, "assistant", answer, meta)
         await store.save_state(conv_id, new_state)
-        if cache_key and plan.intent not in ("chitchat", "out_of_scope") and not plan.city:
+        if cache_key and not cut_short and plan.intent not in ("chitchat", "out_of_scope") and not plan.city:
             await store.cache_put(cache_key, {"answer": answer, "cars": cards[:6], "sources": sources, "followups": fups,
                                               "trace": trace, "active_cars": new_state.active_cars,
                                               "focus_car": new_state.focus_car, "filters": new_state.filters,
@@ -529,8 +611,16 @@ class Pipeline:
     def _busy(e: LLMUnavailable) -> str:
         if getattr(e, "auth", False):
             return "The AI service is not configured correctly (Groq API key missing or invalid)."
+        if not getattr(e, "rate_limited", False):  # down / unreachable / errors: not a quota problem
+            return "The AI service is temporarily unavailable. Please try again in a moment."
         wait = f" in about {int(e.retry_after)} seconds" if e.retry_after else " in a moment"
         return f"The AI service is at its free-tier limit right now. Please try again{wait}."
+
+    @staticmethod
+    def _retry_text(e: LLMUnavailable, wait: float) -> str:
+        if getattr(e, "rate_limited", False):
+            return f"Groq free-tier limit reached — retrying in {wait:.0f}s…"
+        return f"The AI service did not respond — retrying in {wait:.0f}s…"
 
     async def _simple_answer(self, conv_id, st, message, history, plan, trace, timer, planner_info):
         msgs = [{"role": "system", "content": CHITCHAT_SYSTEM}]

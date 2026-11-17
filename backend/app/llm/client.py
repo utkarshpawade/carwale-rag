@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, TypeVar
 
 import groq
+import httpx
 from pydantic import BaseModel, ValidationError
 
 from ..config import Settings
@@ -28,10 +29,14 @@ STRICT_SCHEMA_MODELS = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3
 
 
 class LLMUnavailable(Exception):
-    def __init__(self, msg: str, retry_after: float | None = None, auth: bool = False):
+    """rate_limited=True only when a rate limit (429 / cooldown / no token budget) is the reason: users are told
+    'free-tier limit' only then, not when the service is down or unreachable."""
+
+    def __init__(self, msg: str, retry_after: float | None = None, auth: bool = False, rate_limited: bool = False):
         super().__init__(msg)
         self.retry_after = retry_after
         self.auth = auth
+        self.rate_limited = rate_limited
 
 
 @dataclass
@@ -75,6 +80,17 @@ def _duration(s: str | None) -> float | None:
         found = True
         total += float(value) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
     return total if found else None
+
+
+def _rate_limited(info: CallInfo) -> bool:
+    return any(a.endswith(":rate_limited") for a in info.attempts) or \
+        any(s.endswith((":cooling", ":no_token_budget")) for s in info.skipped)
+
+
+def _unavailable(role: str, info: CallInfo, retry_after: float) -> LLMUnavailable:
+    limited = _rate_limited(info)
+    return LLMUnavailable(f"no {role} model available ({', '.join(info.attempts + info.skipped)})",
+                          retry_after if limited else None, rate_limited=limited)
 
 
 def _est_tokens(messages: list[dict], extra: str = "") -> int:
@@ -177,7 +193,8 @@ class LLMClient:
                     last_retry = self._on_429(model, e)
                     info.attempts.append(f"{model}:rate_limited")
                     break
-                except (ValidationError, json.JSONDecodeError) as e:
+                except (ValidationError, json.JSONDecodeError, TypeError, ValueError, OverflowError) as e:
+                    # any validator surprise is treated like invalid JSON (repair / next model), never a crashed turn
                     info.attempts.append(f"{model}:invalid_json")
                     if rf["type"] == "json_schema" or attempt == 1:
                         break
@@ -190,7 +207,7 @@ class LLMClient:
                 except (groq.APIConnectionError, groq.APITimeoutError):
                     info.attempts.append(f"{model}:timeout")
                     break
-        raise LLMUnavailable(f"no {role} model available ({', '.join(info.attempts)})", last_retry)
+        raise _unavailable(role, info, last_retry)
 
     # ---------------------------------------------------------------- streaming text
     async def stream(self, role: str, messages: list[dict], max_tokens: int, info: CallInfo,
@@ -222,6 +239,9 @@ class LLMClient:
                     usage = getattr(xg, "usage", None) if xg else None
                     if usage:
                         info.prompt_tokens, info.completion_tokens = usage.prompt_tokens, usage.completion_tokens
+                if not emitted:  # a completion with no text: try the next model instead of showing a blank answer
+                    info.attempts.append(f"{model}:empty")
+                    continue
                 info.model = model
                 info.latency_ms = int((time.time() - t0) * 1000)
                 return
@@ -229,14 +249,19 @@ class LLMClient:
                 last_retry = self._on_429(model, e)
                 info.attempts.append(f"{model}:rate_limited")
                 if emitted:
-                    raise LLMUnavailable("rate limited mid-stream", last_retry)
+                    raise LLMUnavailable("rate limited mid-stream", last_retry, rate_limited=True)
             except (groq.AuthenticationError, groq.PermissionDeniedError) as e:
                 raise LLMUnavailable(f"Groq API key missing or invalid: {e}", auth=True)
             except (groq.APIStatusError, groq.APIConnectionError, groq.APITimeoutError) as e:
                 info.attempts.append(_status_reason(model, e) if isinstance(e, groq.APIStatusError) else f"{model}:timeout")
                 if emitted:
                     raise LLMUnavailable("stream interrupted")
-        raise LLMUnavailable(f"no {role} model available ({', '.join(info.attempts)})", last_retry)
+            except (groq.APIError, httpx.HTTPError) as e:
+                # an error event inside the stream, or the connection dropping mid-stream: the SDK does not wrap these
+                info.attempts.append(f"{model}:stream_error")
+                if emitted:
+                    raise LLMUnavailable("stream interrupted") from e
+        raise _unavailable(role, info, last_retry)
 
     def _on_429(self, model: str, e: Exception) -> float:
         headers = getattr(getattr(e, "response", None), "headers", {}) or {}

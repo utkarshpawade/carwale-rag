@@ -69,7 +69,8 @@ class Chunker:
         self.counter = Counter()
 
     def add(self, m: dict | None, section: str, title: str, body: str, url: str | None = None,
-            variant_id: int | None = None, free_prefix: str = "Car glossary", free_key: str = "glossary") -> None:
+            variant_id: int | None = None, free_prefix: str = "Car glossary", free_key: str = "glossary",
+            brand: str | None = None) -> None:
         for piece in split_text(body):
             key = (m["id"] if m else free_key, section)
             self.counter[key] += 1
@@ -82,7 +83,7 @@ class Chunker:
                 "title": title,
                 "content": content,
                 "url": url or (m["url"] if m else None),
-                "brand": m.get("brand") if m else None,
+                "brand": m.get("brand") if m else brand,
                 "body_type": m.get("body_type") if m else None,
                 "fuel_types": m.get("fuel_types") or [] if m else [],
                 "price_min": m.get("price_min") if m else None,
@@ -311,6 +312,21 @@ def model_chunks(ch: Chunker, m: dict, vars_: list[dict]) -> None:
             news.append(f"- {t}" + (f" ({d})" if d else ""))
     if news:
         ch.add(m, "news", f"Latest CarWale news (as of {m.get('scraped_at')})", "\n".join(news[:20]))
+    for a in m.get("news_articles") or []:  # bodies of the latest articles (launch details, price changes, sales)
+        ch.add(m, "news_article", f"CarWale news: {a['title']}" + (f" ({a['date']})" if a.get("date") else ""),
+               a["text"], url=a["url"])
+    if m.get("colours"):
+        names = list(dict.fromkeys(m["colours"]))
+        ch.add(m, "colours", "Colours", f"{m['full_name']} is offered in {len(names)} colour{'s' * (len(names) != 1)}: "
+               + ", ".join(names) + ".", url=f"{m['url']}colours/")
+    o = m.get("offers")
+    if o and (o.get("items") or o.get("heading")):
+        lines = [f"{o.get('heading') or 'Current offers'} (CarWale offers page"
+                 + (f", shown for {o['city']}" if o.get("city") else "") + f", as of {m.get('scraped_at')}):"]
+        lines += [f"- {t}" for t in o.get("items") or []]
+        lines += [x for x in (o.get("description"), o.get("valid")) if x]
+        lines += [f"Note: {t}" for t in o.get("notes") or []]
+        ch.add(m, "offers", "Current offers and discounts", "\n".join(lines), url=f"{m['url']}offers/")
 
     # 10. on-road prices per city (per variant + breakup) ------------------------------------
     for cp in m.get("city_pages") or []:
@@ -376,6 +392,24 @@ def best_list_chunks(ch: Chunker) -> None:
         ch.add(None, "best_list", bl["title"], body, url=bl["url"], free_prefix="CarWale list", free_key="bestlist")
 
 
+def brand_chunks(ch: Chunker) -> None:
+    """Brand overview (history, market share, presence, key highlights), discontinued models and brand FAQs."""
+    path = PROCESSED / "brands.jsonl"
+    if not path.exists():
+        return
+    for b in read_jsonl(path):
+        kw = dict(url=b["url"], free_prefix="CarWale brand page", free_key=f"brand-{b['slug']}", brand=b["name"])
+        hl = "\n".join(f"- {k}: {v}" for k, v in b["highlights"].items())
+        ch.add(None, "brand", f"{b['name']} cars in India", "\n".join(x for x in (hl, b["description"]) if x), **kw)
+        if b["discontinued"]:
+            rows = [f"- {d['name']}" + (f" (launched {d['launched']}, discontinued {d['discontinued']})"
+                                       if d["launched"] and d["discontinued"] else "") for d in b["discontinued"]]
+            ch.add(None, "brand", f"Discontinued {b['name']} cars", f"{len(rows)} {b['name']} models CarWale lists as "
+                   "discontinued (no longer sold new):\n" + "\n".join(rows), **kw)
+        if b["faqs"]:
+            ch.add(None, "brand", f"{b['name']} FAQs", "\n".join(f"Q: {f['q']}\nA: {f['a']}" for f in b["faqs"]), **kw)
+
+
 def glossary_chunks(ch: Chunker) -> None:
     if not GLOSSARY.exists():
         return
@@ -401,6 +435,7 @@ def main() -> None:
         model_chunks(ch, m, by_model.get(m["id"], []))
     glossary_chunks(ch)
     best_list_chunks(ch)
+    brand_chunks(ch)
     n = write_jsonl(PROCESSED / "chunks.jsonl", ch.rows)
     print(f"wrote {n} chunks")
     print("by section:", dict(Counter(r["section"] for r in ch.rows).most_common()))

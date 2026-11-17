@@ -426,7 +426,7 @@ def trim_highlights(tp: dict) -> dict:
 def review_page_reviews(model_url: str) -> list[dict]:
     """Owner reviews from the dedicated review pages (/reviews/, /reviews/page/N/)."""
     out = []
-    for page in range(1, 6):
+    for page in range(1, 9):  # stage 5 fetched pages 4-8 for popular models
         url = f"{model_url}reviews/" if page == 1 else f"{model_url}reviews/page/{page}/"
         html = read_cached(url)
         if not html:
@@ -452,7 +452,7 @@ def review_page_reviews(model_url: str) -> list[dict]:
     return out
 
 
-def merge_reviews(a: list[dict], b: list[dict], cap: int = 40) -> list[dict]:
+def merge_reviews(a: list[dict], b: list[dict], cap: int = 80) -> list[dict]:
     seen, out = set(), []
     for r in a + b:
         if r.get("id") in seen or not r.get("text"):
@@ -507,15 +507,23 @@ def norm_city(name: str | None) -> str:
     return re.sub(r"[^a-z]", "", (name or "").lower())
 
 
+# cities with per-variant /price-in-<city>/ pages (stage 3: Mumbai, Delhi; stage 4: ten more)
+CITY_SLUGS = ("mumbai", "delhi", "bangalore", "hyderabad", "pune", "chennai", "kolkata", "ahmedabad", "jaipur",
+              "lucknow", "chandigarh", "kochi", "gurgaon", "noida", "thane", "navi-mumbai", "indore", "nagpur",
+              "surat", "coimbatore")
+
+
 def city_price_pages(model_url: str) -> list[dict]:
     """Per-variant on-road prices (+ one full breakup, nearby cities, city FAQs) from /price-in-<city>/ pages."""
     out = []
-    for city in ("mumbai", "delhi"):
+    for city in CITY_SLUGS:
         html = read_cached(f"{model_url}price-in-{city}/")
         pc = (extract_state(html) or {}).get("priceInCityPage") if html else None
         if not pc:
             continue
         cname = (pc.get("priceLocation") or {}).get("cityName") or city.title()
+        if any(norm_city(o["city"]) == norm_city(cname) for o in out):
+            continue  # CarWale served another city's page (no dealer pricing for the requested city)
         versions, names = [], {}
         for v in pc.get("versions") or []:
             names[v.get("versionId")] = v.get("versionName")
@@ -551,6 +559,81 @@ def news_headlines(model_url: str, limit: int = 15) -> list[dict]:
             u = i.get("url") or ""
             out.append({"title": clean_text(i["title"]), "date": i.get("displayDate"),
                         "url": f"https://www.carwale.com{u}" if u.startswith("/") else u})
+    return out
+
+
+def model_offers(model_url: str) -> dict | None:
+    """The manufacturer offer on /offers/ (CarWale's default city), e.g. 'Benefits up to Rs. 1,00,000', with validity."""
+    html = read_cached(f"{model_url}offers/")
+    od = (extract_state(html) or {}).get("newCarOfferDetail") if html else None
+    if not od:
+        return None
+    oem = od.get("oemOffer") or {}
+    det = oem.get("offerDetails") or {}
+    items = [clean_text(c.get("offerText")) for c in oem.get("categoryDetails") or [] if c.get("offerText")]
+    for d in od.get("dealerOffers") or []:  # rarely filled; keep whatever text it carries
+        t = clean_text(d.get("offerText") or d.get("heading") or d.get("description")) if isinstance(d, dict) else ""
+        if t:
+            items.append(t)
+    if not items and not det.get("heading"):
+        return None
+    return {"heading": clean_text(det.get("heading")), "items": items, "valid": clean_text(det.get("validityText")),
+            "end_date": (det.get("endDate") or "")[:10], "city": (od.get("urlLocation") or {}).get("cityName"),
+            "description": clean_text(det.get("description")), "callout": clean_text(det.get("callOutLine")),
+            "notes": [clean_text(t) for t in det.get("toolTipText") or [] if t and len(t) < 120][:1]}  # skip legal boilerplate
+
+
+NEWS_ARTICLE_CHARS = 2400
+
+
+def news_articles(news: list[dict], limit: int = 10) -> list[dict]:
+    """Bodies of the most recent articles behind a model's news headlines (launches, price changes, sales, recalls)."""
+    out = []
+    for n in news[:limit]:
+        html = read_cached(n["url"]) if n.get("url") else None
+        ed = (extract_state(html) or {}).get("editorialDetails") if html else None
+        if not ed or not ed.get("pageList"):
+            continue
+        text = "\n".join(clean_text(p.get("content")) for p in ed["pageList"] if p.get("content")).strip()
+        if len(text) < 200:
+            continue
+        # absolute publish date ("November 11, 2026, 02:30 PM" -> "November 11, 2026"); listing dates are relative
+        published = ", ".join((ed.get("publishedDate") or "").split(", ")[:2]) or n.get("date")
+        out.append({"title": clean_text(ed.get("title")) or n.get("title"), "date": published,
+                    "url": n["url"], "text": text[:NEWS_ARTICLE_CHARS]})
+    return out
+
+
+def load_brands() -> list[dict]:
+    """Brand pages: overview (history, market share, presence), key highlights, FAQs and discontinued models."""
+    path = DATA / "urls_stage4.json"
+    if not path.exists():
+        return []
+    out = []
+    for url in json.loads(path.read_text(encoding="utf-8")):
+        if not re.fullmatch(r"https://www\.carwale\.com/[a-z0-9-]+-cars/", url):
+            continue
+        html = read_cached(url)
+        mk = (extract_state(html) or {}).get("makePage") if html else None
+        if not mk or not (mk.get("make") or {}).get("makeName"):
+            continue
+        make = mk["make"]
+        disc = []
+        for d in mk.get("discontinuedModels") or []:
+            name = clean_text(d.get("modelName"))
+            if d.get("status") != 3 or not name or re.fullmatch(
+                    r"(?i)((mid|full|sub)[- ]?(size|compact)|compact|small|micro|entry[- ]level)?\s*"
+                    r"(suv|sedan|hatchback|muv|mpv|crossover|ev|electric suv)s?", name):
+                continue  # placeholder entries such as 'mid-size SUV' ('i10', 'i20' are real models)
+            y0, y1 = (d.get("launchedOn") or "")[6:10], (d.get("discontinuedOn") or "")[6:10]
+            ok = y0.isdigit() and y1.isdigit() and y0 <= y1  # CarWale has a few inverted dates; drop those years
+            disc.append({"name": name, "launched": y0 if ok else "", "discontinued": y1 if ok else ""})
+        out.append({"slug": make.get("maskingName"), "name": make["makeName"], "url": url,
+                    "description": clean_text(mk.get("makeDescription")),
+                    "highlights": {k: clean_text(v) for k, v in (mk.get("keyHighlights") or {}).items() if clean_text(v)},
+                    "faqs": [{"q": clean_text(f.get("question")), "a": clean_text(f.get("answer"))}
+                             for f in mk.get("faqs") or [] if f.get("question")],
+                    "discontinued": disc})
     return out
 
 
@@ -652,7 +735,10 @@ def main() -> None:
             model["expert_articles"] = articles.get(model["id"], [])
             model["city_pages"] = city_price_pages(url)
             for cp in model["city_pages"]:
-                model["faqs"].extend(cp.pop("faqs"))
+                city_faqs = cp.pop("faqs")
+                if norm_city(cp["city"]) in ("mumbai", "delhi"):
+                    # other cities' FAQs only restate their on-road chunk (5 per city per model) and crowd retrieval
+                    model["faqs"].extend(city_faqs)
                 known = {norm_city(c["city"]) for c in model["city_prices"]}
                 ons = [v["on_road"] for v in cp["versions"]]
                 if ons and norm_city(cp["city"]) not in known:
@@ -662,6 +748,8 @@ def main() -> None:
                     if norm_city(nb["city"]) not in {norm_city(c["city"]) for c in model["city_prices"]}:
                         model["city_prices"].append(nb)
             model["news"] = news_headlines(url)
+            model["news_articles"] = news_articles(model["news"])
+            model["offers"] = model_offers(url)
             model["comparisons"] = comparisons.get(model["id"], [])
             models.append(finalize_model(model, mvars, tree, tree_version))
             variants.extend(mvars)
@@ -672,12 +760,17 @@ def main() -> None:
     n_v = write_jsonl(PROCESSED / "variants.jsonl", variants)
     best = load_best_lists()
     n_b = write_jsonl(PROCESSED / "best_lists.jsonl", best)
+    brands = load_brands()
+    n_br = write_jsonl(PROCESSED / "brands.jsonl", brands)
     report(models, variants)
     L = [m for m in models if m["status"] == "launched"]
     print(f"city on-road pages: {sum(len(m.get('city_pages') or []) for m in L)} | cities covered (avg/model): "
           f"{sum(len(m['city_prices']) for m in L) / max(len(L), 1):.1f} | news headlines: {sum(len(m.get('news') or []) for m in L)} | "
           f"rival pairs: {sum(len(m.get('comparisons') or []) for m in L)} "
           f"(written verdicts: {sum(1 for m in L for c in m.get('comparisons') or [] if c['text'])}) | best lists: {n_b}")
+    print(f"news articles: {sum(len(m.get('news_articles') or []) for m in L)} | models with colours: "
+          f"{sum(1 for m in L if m.get('colours'))} | with offers: {sum(1 for m in L if m.get('offers'))} | brands: {n_br} | "
+          f"per-variant city pages: {dict(Counter(cp['city'] for m in L for cp in m.get('city_pages') or []))}")
     print(f"\nwrote {n_m} models, {n_v} variants; errors: {len(errors)}")
     for u, e in errors[:15]:
         print("  ERR", u, e)

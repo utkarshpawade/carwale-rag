@@ -7,6 +7,7 @@ imperfect plan is repaired locally instead of failing (and costing a fallback ca
 from __future__ import annotations
 
 import copy
+import math
 import re
 from typing import Annotated, Literal, Optional
 
@@ -75,43 +76,48 @@ def _enum_list(mapping: dict):
 def _str_list(v):
     if v is None:
         return []
-    return [str(x).strip() for x in (v if isinstance(v, list) else [v]) if str(x).strip()]
+    items = (str(x).strip() for x in (v if isinstance(v, list) else [v]) if x is not None)  # [null] is not "None"
+    return [s for s in items if s]
 
 
 def _tags(v):
     return [t for t in (x.lower().replace(" ", "_").replace("-", "_") for x in _str_list(v)) if t in FEATURE_TAGS]
 
 
-def _int(v):
-    if v in (None, "", [], {}):
-        return None
-    try:
-        return int(float(str(v).replace(",", "")))
-    except ValueError:
-        return None
-
-
 def _float(v):
-    if v in (None, ""):
+    """Finite float or None. Never raises: odd model output must degrade to 'not given', not crash validation."""
+    if v in (None, "") or isinstance(v, bool):
         return None
     try:
-        return float(str(v).replace(",", ""))
-    except ValueError:
+        f = float(str(v).replace(",", ""))
+    except (TypeError, ValueError, OverflowError):
         return None
+    return f if math.isfinite(f) else None
+
+
+def _int(v):
+    f = _float(v) if v not in ([], {}) else None
+    return int(f) if f is not None else None
+
+
+_PRICE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(crore|cr|lakh|lac|l)?")
 
 
 def _price(v):
-    """INR. Accepts 1500000, '15 lakh', '1.2 crore', or a bare 15 / '15' (read as lakh)."""
-    if v in (None, "", 0):
+    """INR. Accepts 1500000, '15 lakh', '1.2 crore', 'Rs. 15 lakh', or a bare 15 / '15' (read as lakh)."""
+    if v in (None, "", 0) or isinstance(v, bool):
         return None
     if isinstance(v, str):
-        m = re.search(r"([\d.]+)\s*(crore|cr|lakh|lac|l)?", v.lower().replace(",", ""))
+        m = _PRICE_RE.search(v.lower().replace(",", ""))  # first real number: the "." of "Rs." is not one
         if not m:
             return None
-        n = float(m.group(1))
         unit = m.group(2) or ""
-        v = n * (1e7 if unit.startswith("c") else 1e5 if unit else 1)
+        v = float(m.group(1)) * (1e7 if unit.startswith("c") else 1e5 if unit else 1)
+    elif not isinstance(v, (int, float)):
+        return None  # a list / dict where a number belongs: nothing sensible to read
     v = float(v)
+    if not math.isfinite(v):
+        return None
     if 0 < v < 1000:  # "under 15" almost always means 15 lakh
         v *= 1e5
     return int(v) if v > 0 else None

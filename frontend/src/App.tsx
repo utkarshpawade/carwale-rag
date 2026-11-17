@@ -30,6 +30,7 @@ export default function App() {
   const [sidebar, setSidebar] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const loadSeq = useRef(0); // only the latest history request may replace the thread (clicks can race)
 
   // wake the (free-tier, sleeping) backend as soon as the page loads
   useEffect(() => {
@@ -59,7 +60,10 @@ export default function App() {
     if (server !== "ready") return;
     refreshConversations();
     if (convId) {
-      api.getConversation(convId, userId).then(setMessages).catch(() => { localStorage.removeItem("cw_conv_id"); setConvId(null); });
+      const seq = ++loadSeq.current;
+      api.getConversation(convId, userId)
+        .then((msgs) => { if (seq === loadSeq.current) setMessages(msgs); })
+        .catch(() => { if (seq === loadSeq.current) { localStorage.removeItem("cw_conv_id"); setConvId(null); } });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [server]);
@@ -71,12 +75,14 @@ export default function App() {
 
   const send = async (text: string) => {
     if (streaming || server !== "ready") return;
+    loadSeq.current++; // a history load still in flight must not wipe this new exchange
     const aKey = newKey();
     setMessages((ms) => [...ms, { key: newKey(), role: "user", content: text },
       { key: aKey, role: "assistant", content: "", streaming: true, status: "Understanding your question…" }]);
     setStreaming(true);
     const ctrl = new AbortController();
     abortRef.current = ctrl;
+    let finished = false; // the server ends every turn with 'done' or 'error'
     try {
       await api.streamChat({ user_id: userId, conversation_id: convId, message: text }, (ev, data) => {
         switch (ev) {
@@ -89,10 +95,13 @@ export default function App() {
           case "sources": patch(aKey, (m) => ({ ...m, sources: data.sources })); break;
           case "token": patch(aKey, (m) => ({ ...m, content: m.content + data.text })); break;
           case "followups": patch(aKey, (m) => ({ ...m, followups: data.followups })); break;
-          case "error": patch(aKey, (m) => ({ ...m, error: data.message })); break;
-          case "done": patch(aKey, (m) => ({ ...m, id: data.message_id, streaming: false })); break;
+          case "error": finished = true; patch(aKey, (m) => ({ ...m, error: data.message })); break;
+          case "done": finished = true; patch(aKey, (m) => ({ ...m, id: data.message_id, streaming: false })); break;
         }
       }, ctrl.signal);
+      if (!finished) { // e.g. a proxy closed the connection mid-answer: do not let a truncated answer look complete
+        patch(aKey, (m) => ({ ...m, error: "The connection was interrupted before the answer finished. Please try again." }));
+      }
     } catch (e) {
       const aborted = (e as Error).name === "AbortError";
       patch(aKey, (m) => ({ ...m, error: aborted ? undefined : (e as Error).message || "Network error", content: m.content + (aborted ? "\n\n_(stopped)_" : "") }));
@@ -106,6 +115,7 @@ export default function App() {
 
   const newChat = () => {
     abortRef.current?.abort();
+    loadSeq.current++;
     setMessages([]); setConvId(null); setTrace(null); setSidebar(false);
     localStorage.removeItem("cw_conv_id");
   };
@@ -113,16 +123,22 @@ export default function App() {
     abortRef.current?.abort();
     setSidebar(false); setTrace(null);
     setConvId(id); localStorage.setItem("cw_conv_id", id);
-    setMessages(await api.getConversation(id, userId).catch(() => []));
+    const seq = ++loadSeq.current;
+    const msgs = await api.getConversation(id, userId).catch(() => []);
+    if (seq === loadSeq.current) setMessages(msgs);
   };
   const removeConversation = async (id: string) => {
-    await api.deleteConversation(id, userId);
-    if (id === convId) newChat();
+    try {
+      const res = await api.deleteConversation(id, userId);
+      if ((res.ok || res.status === 404) && id === convId) newChat(); // 404: already gone
+    } catch {
+      // network error: the chat stays listed and can be deleted again
+    }
     refreshConversations();
   };
   const feedback = (m: ChatMessage, rating: number) => {
     if (!m.id) return;
-    api.sendFeedback(m.id, rating);
+    api.sendFeedback(m.id, rating).catch(() => undefined); // best effort: a lost thumbs-up is not worth an error
     patch(m.key, (x) => ({ ...x, feedback: rating }));
   };
   const lastTrace = [...messages].reverse().find((m) => m.trace);

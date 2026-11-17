@@ -62,7 +62,11 @@ export default function MessageView({ m, onFollowup, onTrace, onFeedback, traceO
               </button>
             )}
             {m.content && (
-              <button onClick={() => { navigator.clipboard.writeText(m.content); setCopied(true); setTimeout(() => setCopied(false), 1200); }}
+              <button onClick={() => {
+                        // only confirm once the browser has actually copied (it can refuse, or lack the API on http)
+                        navigator.clipboard?.writeText(m.content)
+                          .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1200); }, () => undefined);
+                      }}
                       className="flex items-center gap-1 text-xs rounded-md px-2 py-1 hover:bg-slate-100 hover:text-slate-600">
                 <CopyIcon className="w-3.5 h-3.5" /> {copied ? "Copied" : "Copy"}
               </button>

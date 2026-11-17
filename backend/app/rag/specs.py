@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import OrderedDict
 
 from rapidfuzz import fuzz
@@ -86,7 +87,9 @@ def filter_variants(vs: list[dict], fuel: str | None, trans: str | None, hint: s
             notes.append(f"no {trans.lower()} variant is listed")
     if hint:
         h = norm(hint)
-        sel = [v for v in out if h and (h in norm(v.get("name") or "") or fuzz.ratio(h, norm(v.get("trim") or "")) >= 85)]
+        # whole words only: trim names like "E" or "S" must not match every name containing that letter
+        word = re.compile(rf"(?<![a-z0-9]){re.escape(h)}(?![a-z0-9])") if h else None
+        sel = [v for v in out if h and (word.search(norm(v.get("name") or "")) or fuzz.ratio(h, norm(v.get("trim") or "")) >= 85)]
         if sel:
             out = sel
         else:
@@ -207,7 +210,13 @@ def facts(m: dict, vs: list[dict], aspects: set[str], city: str | None = None, c
         if d.get("cons"):
             f["Cons"] = "; ".join(d["cons"][:3])
     if aspects & {"colours"} and d.get("colours"):
-        f["Colours"] = ", ".join(d["colours"][:12])
+        f[f"Colours ({len(d['colours'])})"] = ", ".join(d["colours"][:14])
+    if aspects & {"offers"}:
+        o = d.get("offers")
+        label = f"Current offers (CarWale, shown for {o['city']}; other cities and dealers may differ)" \
+            if o and o.get("city") else "Current offers"
+        f[label] = ("; ".join(o.get("items") or [o.get("heading") or "listed"])
+                    + (f" ({o['valid']})" if o.get("valid") else "") if o else "no offer listed on CarWale right now")
     return f
 
 
@@ -233,15 +242,25 @@ FEATURE_SYNONYMS = {
 }
 
 
+# Phrases must start at a word boundary ("ota" is not inside "Toyota"). Short ones and a few that are prefixes of
+# unrelated words must also end at one ("cruise" vs "Urban Cruiser", "rear ac" vs "rear acceleration"); longer
+# phrases stay prefixes on purpose ("wireless charg" -> charging/charger, "leather" -> leatherette).
+_WHOLE_WORD_PHRASES = {"cruise", "rear ac"}
+_FEATURE_PATTERNS = [
+    (p, re.compile(r"(?<![a-z0-9])" + re.escape(p) + (r"(?![a-z0-9])" if len(p) <= 4 or p in _WHOLE_WORD_PHRASES else "")))
+    for p in sorted(FEATURE_SYNONYMS, key=len, reverse=True)  # longest phrase wins ("panoramic sunroof")
+]
+
+
 def detect_features(text: str) -> list[str]:
     """Feature tags named in free text ('which variants get ventilated seats' -> ['ventilated_seats'])."""
     low, hits = text.lower(), []
-    for phrase in sorted(FEATURE_SYNONYMS, key=len, reverse=True):  # longest phrase wins ("panoramic sunroof")
-        idx = low.find(phrase)
-        while idx >= 0:
-            hits.append((idx, FEATURE_SYNONYMS[phrase]))
-            low = low[:idx] + " " * len(phrase) + low[idx + len(phrase):]  # blank out, keep positions
-            idx = low.find(phrase)
+    for phrase, rx in _FEATURE_PATTERNS:
+        m = rx.search(low)
+        while m:
+            hits.append((m.start(), FEATURE_SYNONYMS[phrase]))
+            low = low[:m.start()] + " " * len(phrase) + low[m.end():]  # blank out, keep positions
+            m = rx.search(low)
     out: list[str] = []
     for _, tag in sorted(hits):  # report in the order the user mentioned them
         if tag not in out:

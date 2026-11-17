@@ -30,7 +30,12 @@
     {"q": "What is the on-road price of the Hyundai Creta SX in Mumbai?", "intent": ["price"], "targets": ["hyundai/creta"], "sections_any": ["on_road", "city_prices"]},
     {"q": "Creta vs Seltos - which one should I buy?", "intent": ["compare"], "targets": ["hyundai/creta", "kia/seltos"], "sections_any": ["comparison"]},
     {"q": "Best SUVs under 15 lakh", "intent": ["recommend"], "route": "structured_search", "sections_any": ["best_list"]},
-    {"q": "Any latest news on the Creta?", "intent": ["general", "review", "spec"], "targets": ["hyundai/creta"], "sections_any": ["news"]}
+    {"q": "Any latest news on the Creta?", "intent": ["general", "review", "spec"], "targets": ["hyundai/creta"], "sections_any": ["news"]},
+    {"q": "What colours does the Kia Seltos come in?", "intent": ["spec", "general", "feature_check"], "targets": ["kia/seltos"], "sections_any": ["colours"]},
+    {"q": "Are there any discounts on the Hyundai Creta this month?", "intent": ["price", "general", "review", "spec"], "targets": ["hyundai/creta"], "sections_any": ["offers"]},
+    {"q": "Tata Nexon on-road price in Bengaluru", "intent": ["price"], "targets": ["tata/nexon"], "sections_any": ["on_road"]},
+    {"q": "Which Hyundai cars have been discontinued?", "intent": ["general"], "route": "semantic_search", "sections_any": ["brand"]},
+    {"q": "What is the waiting period news for the Mahindra XUV 7XO?", "intent": ["general", "review", "spec", "price"], "targets": ["mahindra/xuv-7xo"], "sections_any": ["news", "news_article"]}
   ],
   "multi_turn": [
     {"name": "hybrid shopping", "turns": [

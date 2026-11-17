@@ -42,8 +42,11 @@ def read_cached(url: str) -> str | None:
     p = cache_path(url)
     if not p.exists():
         return None
-    with gzip.open(p, "rt", encoding="utf-8") as f:
-        return f.read()
+    try:
+        with gzip.open(p, "rt", encoding="utf-8") as f:
+            return f.read()
+    except (EOFError, OSError):  # a page the fetcher is still writing (parse can run during a crawl): treat as missing
+        return None
 
 
 def extract_state(html: str) -> dict | None:

@@ -1,0 +1,5 @@
+# Test tooling (Python 3.12). Install: uv pip install -r requirements-dev.txt   (or pip install -r ...)
+-r backend/requirements.txt
+pytest==9.2.0
+pytest-cov==7.0.0
+# anyio (async test runner plugin) comes with httpx / starlette

@@ -200,3 +200,64 @@ def test_crash_rating_distinguishes_not_tested_from_unlisted():
     assert crash_rating({"ncap_rating": 5, "ncap_agency": "Bharat NCAP"}, []) == "5-star (Bharat NCAP)"
     assert crash_rating({}, [{"specs": {"NCAP Rating": "Not Tested"}}]).startswith("Not Tested")
     assert crash_rating({}, [{"specs": {}}, {"specs": None}]) == "no crash-test rating listed on CarWale"
+
+
+def test_fuzzy_text_scan_catches_typos_only(resolver):
+    assert resolver.find_fuzzy_in_text("fortuneer price in delhi") == ["toyota/fortuner"]
+    assert resolver.find_fuzzy_in_text("is the seltoss good") == ["kia/seltos"]
+    for q in ("elevated seating position suv", "which cars have better resale value?", "compare their prices",
+              "safest family cars", "electric suv with longest range"):
+        assert resolver.find_fuzzy_in_text(q) == [], q
+
+
+def test_planner_cannot_swap_in_an_unnamed_car(resolver):
+    from app.rag.schemas import QueryPlan
+    p = Pipeline.__new__(Pipeline)
+    p.resolver = resolver
+
+    def plan(*mentions, intent="price", fuel=None):
+        return QueryPlan(standalone_query="q", intent=intent,
+                         cars=[{"mention": m, "variant_hint": "Fortuner (O)", "fuel_hint": fuel, "transmission_hint": None}
+                               for m in mentions])
+
+    pl = plan("Mahindra Thar")  # qwen's misreading of the typo
+    assert p._ground_cars(pl, "fortuneer price in delhi") and [c.mention for c in pl.cars] == ["Toyota Fortuner"]
+    assert pl.cars[0].variant_hint is None  # hint not in the message -> dropped
+    pl = plan("Mahindra Thar", fuel="Diesel")
+    p._ground_cars(pl, "fortuneer diesel price")
+    assert pl.cars[0].fuel_hint == "Diesel"  # hint the user typed is kept
+    for mentions, msg in ((("Tata Punch EV",), "punch electric range"),            # sibling model
+                          (("Hyundai Creta", "Kia Seltos"), "is it better than the Seltos?"),  # memory car + named car
+                          (("Hyundai Creta", "Kia Seltos"), "which is cheaper?")):           # nothing named
+        pl = plan(*mentions)
+        assert p._ground_cars(pl, msg) == [] and [c.mention for c in pl.cars] == list(mentions), msg
+
+
+def test_city_canonicalisation_and_backstop(resolver):
+    from app.rag.orchestrator import canon_city
+    from app.rag.schemas import QueryPlan
+    assert canon_city("bengaluru") == "Bangalore" and canon_city("New Delhi") == "Delhi" and canon_city("pune") == "Pune"
+    assert canon_city("Navi-Mumbai") == "Navi Mumbai" and canon_city(None) is None
+    p = Pipeline.__new__(Pipeline)
+    p.resolver = resolver
+    pl = QueryPlan(standalone_query="q", intent="price", cars=[{"mention": "Hyundai Creta"}])
+    p._backstops(pl, "creta on road price in bengaluru")
+    assert pl.city == "Bangalore"
+    pl = QueryPlan(standalone_query="q", intent="price", cars=[{"mention": "Honda City"}])
+    p._backstops(pl, "honda city price")
+    assert pl.city is None  # the car, not a city
+
+
+def test_colour_offer_and_discontinued_cues(resolver):
+    from app.rag.orchestrator import COLOUR_RE, OFFER_RE
+    from app.rag.schemas import QueryPlan
+    assert COLOUR_RE.search("what colours does the creta come in") and COLOUR_RE.search("nexon color options")
+    assert OFFER_RE.search("any offers on the nexon?") and OFFER_RE.search("discount on creta this month")
+    assert not OFFER_RE.search("What features does the Creta offer?") and not OFFER_RE.search("the Creta offers ADAS")
+    assert resolver.brands_in_text("which hyundai cars are discontinued") == ["hyundai"]
+    assert resolver.brands_in_text("best mini suv under 10 lakh") == []
+    p = Pipeline.__new__(Pipeline)
+    p.resolver = resolver
+    pl = QueryPlan(standalone_query="q", intent="recommend", filters={"brands": ["Hyundai"]})
+    p._backstops(pl, "Which Hyundai cars are discontinued?")
+    assert pl.intent == "general" and not pl.filters.brands

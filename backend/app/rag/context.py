@@ -8,7 +8,10 @@ def est_tokens(s: str) -> int:
 
 def chunk_label(content: str, title: str | None) -> tuple[str, str]:
     first = content.split("\n", 1)[0]
-    car = first.split(" | ")[0].replace("Car glossary — ", "Glossary")
+    if " | " not in first and " — " in first:  # free chunks: "Car glossary — ADAS", "CarWale list — Best SUVs ..."
+        prefix, sec = first.split(" — ", 1)
+        return ("Glossary" if prefix == "Car glossary" else prefix), sec
+    car = first.split(" | ")[0]
     sec = first.rsplit(" — ", 1)[-1] if " — " in first else (title or "")
     return car, sec
 
