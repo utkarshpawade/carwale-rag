@@ -119,8 +119,10 @@ def main() -> None:
         (DATA / "urls_trims.json").write_text(json.dumps(urls, indent=1), encoding="utf-8")
     elif what == "alt_trims":
         urls = alt_trim_urls()
+    elif what == "file":
+        urls = json.loads(open(sys.argv[2], encoding="utf-8").read())
     else:
-        raise SystemExit("usage: python -m ingestion.fetch [models|trims|alt_trims]")
+        raise SystemExit("usage: python -m ingestion.fetch [models|trims|alt_trims|file <urls.json>]")
     asyncio.run(fetch_all(urls))
 
 

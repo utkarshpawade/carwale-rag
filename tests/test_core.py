@@ -131,6 +131,15 @@ def test_plan_schema_is_strict():
     Filters.model_validate(empty_filters().model_dump())
 
 
+def test_split_text_keeps_lines_and_limit():
+    from ingestion.build_chunks import split_text
+    text = "\n".join(f"Group {i}: " + "; ".join(f"feature {i}-{j}" for j in range(40)) for i in range(6))
+    parts = split_text(text, 500)
+    assert all(len(p) <= 500 for p in parts)
+    assert any("\n" in p for p in parts) or len(parts) == len(text.split("\n"))
+    assert "".join(parts).count("feature 5-39") == 1
+
+
 def test_digest():
     d = Pipeline._digest("**Grand Vitara** is | great |", ["Maruti Suzuki Grand Vitara"])
     assert d.startswith("[cars: Maruti Suzuki Grand Vitara]") and "|" not in d.split("]", 1)[1]

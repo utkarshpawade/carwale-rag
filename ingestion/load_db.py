@@ -31,7 +31,8 @@ MODEL_COLS = ["id", "cw_model_id", "brand", "brand_slug", "name", "slug", "full_
               "mileage_best", "range_best_km", "power_max_bhp", "boot_l", "ground_clearance_mm", "user_rating",
               "user_rating_count", "expert_rating_5", "feature_tags", "image_url"]
 # bulky text lives in chunks; keep the structured remainder in models.data
-DATA_DROP = {"owner_reviews", "expert_review", "synopsis", "expert_opinion", "faqs", "upcoming_mentions"}
+DATA_DROP = {"owner_reviews", "expert_review", "synopsis", "expert_opinion", "faqs", "upcoming_mentions",
+             "trim_features", "expert_articles"}
 VARIANT_COLS = ["version_id", "model_id", "name", "display_name", "trim", "url", "price", "fuel_type", "hybrid_type",
                 "transmission", "is_automatic", "engine_cc", "power_bhp", "torque_nm", "mileage_arai", "mileage_unit",
                 "mileage_owner", "mileage_expected", "mileage_effective", "mileage_basis", "mileage_city_tested", "mileage_highway_tested", "range_km", "battery_kwh",
@@ -92,6 +93,7 @@ def main() -> None:
             cur.execute("SELECT id, content_hash FROM chunks WHERE embedding IS NOT NULL")
             existing = dict(cur.fetchall())
             todo = [c for c in chunks if existing.get(c["id"]) != c["content_hash"]]
+            todo.sort(key=lambda c: len(c["content"]))  # similar lengths per batch -> less padding, faster embedding
             print(f"chunks: {len(chunks)} total, {len(todo)} new/changed -> embedding ...", flush=True)
             reuse = load_embedding_source()  # content_hash -> vector from another DB (e.g. local -> Neon)
             if todo:

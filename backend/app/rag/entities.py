@@ -35,6 +35,13 @@ GENERIC_MENTION = FILLER | {"ev", "electric", "version", "variant", "variants", 
                             "this", "that", "cheaper", "cheapest", "facelift", "mid", "higher", "lower", "option"}
 
 
+# model names that are also everyday words: only matched in free text together with the brand ("honda city")
+COMMON_WORD_MODELS = {"city", "swift", "elevate", "safari", "defender", "discovery", "phantom", "vantage", "superb",
+                      "seal", "carnival", "comet", "boulder", "ghost", "spectre", "aura", "venue", "punch", "duster",
+                      "compass", "wrangler", "meridian", "alpha", "prelude", "roma", "windsor", "atto", "glanza",
+                      "amaze", "tera", "tiago", "magnite", "kicks", "celerio", "ignis", "camry", "gravite"}
+
+
 def is_generic(mention: str) -> bool:
     toks = norm(mention).split()
     return not toks or all(t in GENERIC_MENTION for t in toks)
@@ -166,6 +173,26 @@ class CarResolver:
         out = [Resolved(top_id, self.models[top_id]["full_name"], round(top_score, 1), top_alias, close)]
         out += [Resolved(mid, self.models[mid]["full_name"], round(s, 1), a) for mid, (s, a) in ranked[1:4]]
         return out
+
+    def find_in_text(self, text: str, limit: int = 3) -> list[str]:
+        """Exact strong-alias matches of car names inside free text (longest n-grams first). Used as a backstop."""
+        toks = norm(text).split()
+        found: list[str] = []
+        used = [False] * len(toks)
+        for n in (4, 3, 2, 1):
+            for i in range(len(toks) - n + 1):
+                if any(used[i:i + n]):
+                    continue
+                gram = " ".join(toks[i:i + n])
+                if len(gram) < 4 or is_generic(gram) or gram in self.brand_words or gram in COMMON_WORD_MODELS:
+                    continue
+                ids = self.strong.get(gram)
+                if ids:
+                    best = self._rank(ids, 100.0, gram, False)[0].model_id
+                    if best not in found:
+                        found.append(best)
+                    used[i:i + n] = [True] * n
+        return found[:limit]
 
     def brand_slug(self, text: str) -> str | None:
         return self.brand_words.get(norm(text))

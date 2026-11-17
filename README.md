@@ -5,7 +5,7 @@ Ask anything about new cars in India: prices, mileage, specs, features, safety, 
 conversation, so follow-ups such as *"which one has the best mileage?"*, *"what about its safety?"* and
 *"only 7 seaters"* just work.
 
-- **Data:** 400 models (288 on sale, 112 upcoming), 2,283 variants and 13,889 retrieval chunks, crawled politely from carwale.com
+- **Data:** 400 models (288 on sale, 112 upcoming), 2,283 variants, 912 trim feature trees, 4,458 owner reviews and 390 expert articles (incl. 54 long-term reports), giving 21,416 retrieval chunks crawled politely from carwale.com
 - **Stack:** FastAPI · Groq (gpt-oss-120b / gpt-oss-20b / Llama 3.x) · Postgres + pgvector (Neon) · fastembed (bge-small, ONNX) · React + Vite + Tailwind
 - **Live:** frontend `https://<your-app>.vercel.app` · API `https://<your-api>.onrender.com/docs`
 
@@ -81,7 +81,11 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
 - **Pages:** every **model page** plus **one top-trim page per model**. Each page embeds its full app state as JSON
   (`<script id="initial-state">`), so parsing reads clean JSON rather than fragile CSS selectors. A single trim page holds the
   86-item spec sheet for *every* version of the model, plus the full feature tree (ADAS, connected-car and so on) of that
-  trim. That cut the crawl from ~3,500 pages to 720. The crawl took about 7 minutes at ~1.7 requests per second, with 2 parallel requests, backoff and a disk cache.
+  trim. That cut the first crawl from ~3,500 pages to 720. The crawl took about 7 minutes at ~1.7 requests per second, with 2 parallel requests, backoff and a disk cache.
+- **Second pass (`ingestion/discover_more.py`):** about 1,560 more pages, all robots.txt-allowed:
+  - **Every trim page (912):** each trim's full feature tree plus CarWale's own diff of what it adds over the trim below. This powers "which variant has X" and "is SX worth it over S".
+  - **Owner-review pages:** up to 3 per model (30 reviews), giving 4,458 reviews in total. Each has category ratings, including after-sales cost and experience.
+  - **Expert articles (390):** long-term reports (city/highway mileage, 10,000 km service visits), first drives and the like. Articles about an earlier generation of the same nameplate are labelled as such.
 - **Captured per model:**
   - prices (ex-showroom per version, plus on-road prices in 8 cities)
   - full specs and features
@@ -108,8 +112,17 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
   | EV range | 94% |
   | NCAP | 55% (many cars were never crash-tested) |
 
-- **Known gap:** CarWale doesn't publish scheduled service costs. Service answers therefore use warranty, owner after-sales
-  feedback and FAQs, and say plainly what isn't available.
+- **Known gap:** CarWale doesn't publish a scheduled service-cost table. Service answers therefore use warranty, owners'
+  after-sales ratings and CarWale's long-term service reports (where they exist), and say plainly what isn't available.
+- **Embedding speed:** sorting chunks by length before batching cuts padding, giving 1.9x throughput on CPU with identical vectors. Re-runs only embed chunks whose `content_hash` changed, and Neon reuses the local vectors.
+
+### Retrieval refinements
+- **Two-tier retrieval:** each intent's core sections get 4 slots and aspect extras (long-term reports, owner reviews) get 2, so plentiful review text can't crowd out the core facts.
+- **Pinned chunks:** the dedicated summary chunk for the aspect asked about (mileage, safety, service, prices) is always included, fetched directly rather than ranked.
+- **Deterministic backstops** for the few plan mistakes the eval exposed:
+  - a message that names a catalog car is never treated as out of scope;
+  - explicit fuel words ("electric", "diesel") become filters if the planner missed them;
+  - "its EV version" resolves through memory to the EV model.
 
 ## Groq free-tier strategy
 - **Models:** this free-tier key can access only `gpt-oss-120b`, `gpt-oss-20b` and `qwen3.8-27b`; the Llama models are not available (checked via `/models`). Each model has its own limits, read from the response headers: 8K tokens per minute and 1K requests per day.
@@ -128,8 +141,10 @@ The UI's **"How I answered this"** panel shows this exact trace live for every a
 - **Demo the fallback chain:** set `FORCE_FAIL_MODELS=openai/gpt-oss-120b`.
 
 ## Evaluation results
-`python eval/run_eval.py` (dry run: planner + routing + retrieval) on 20 single-turn and 7 multi-turn cases gives
-**27/27 passed (100%)**, with planner + retrieval latency of **p50 784 ms and p95 1.25 s**.
+`python eval/run_eval.py` (dry run: planner + routing + retrieval) on 25 single-turn and 7 multi-turn cases gives
+**32/32 passed**, with planner + retrieval latency of **p50 ~0.9–1.0 s**. One case was a free-tier rate-limit miss during a fast back-to-back run and passed on re-run.
+
+The new cases cover variant diffs, which variants have a feature, long-term service experience, owner complaints and real-world mileage.
 
 The cases cover every intent; typos, renames and Hinglish ("fortuneer", "xuv700", "brezza ka mileage kitna hai"); structured searches with numeric and feature filters; references to earlier turns ("which one", "its", "the second one"); and refinement ("only 7 seaters").
 

@@ -26,6 +26,17 @@ def tsquery_from(keywords: list[str], query: str, limit: int = 12) -> str | None
     return " | ".join(words[:limit]) or None
 
 
+async def pinned_chunks(model_ids: list[str], sections: list[str]) -> list[dict]:
+    """The canonical summary chunk per (car, aspect) - e.g. the 'mileage' chunk for a mileage question."""
+    if not model_ids or not sections:
+        return []
+    return await fetch("""
+        SELECT DISTINCT ON (model_id, section) id, model_id, section, title, content, url,
+               1.0::float AS score, ARRAY['pinned'] AS via
+        FROM chunks WHERE model_id = ANY(%s) AND section = ANY(%s)
+        ORDER BY model_id, section, id""", (model_ids, sections))
+
+
 async def hybrid_search(qvec, query: str, keywords: list[str], model_ids: list[str] | None = None,
                         sections: list[str] | None = None, k: int = 6, per_model_cap: int | None = None) -> list[dict]:
     filt, p = [], {"qv": np.asarray(qvec, dtype=np.float32), "k": k * 3 if per_model_cap else k}

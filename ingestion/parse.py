@@ -403,9 +403,100 @@ def finalize_model(model: dict, variants: list[dict], tree: dict, tree_version: 
     return model
 
 
+def trim_highlights(tp: dict) -> dict:
+    """What this trim adds over the trim below it (and what the next trim adds) - CarWale's own diff."""
+    def fmt(items):
+        out = []
+        for i in items or []:
+            name = (i.get("itemName") or "").strip()
+            val = clean_text(str(i.get("value") or "")).strip()
+            if name:
+                out.append(name if val in ("", "Yes") else f"{name}: {val}")
+        return out
+    for cat in tp.get("specsFeaturesMaster") or []:
+        for sub in cat.get("subCategories") or []:
+            hl = sub.get("highLights") or {}
+            if hl.get("addedInCurrent") or hl.get("addedInNext") or hl.get("lowerTrimName") or hl.get("upperTrimName"):
+                return {"lower_trim": hl.get("lowerTrimName") or None, "upper_trim": hl.get("upperTrimName") or None,
+                        "added": fmt(hl.get("addedInCurrent")), "next_adds": fmt(hl.get("addedInNext")),
+                        "segment_best": fmt(hl.get("segmentBest"))}
+    return {}
+
+
+def review_page_reviews(model_url: str) -> list[dict]:
+    """Owner reviews from the dedicated review pages (/reviews/, /reviews/page/N/)."""
+    out = []
+    for page in range(1, 6):
+        url = f"{model_url}reviews/" if page == 1 else f"{model_url}reviews/page/{page}/"
+        html = read_cached(url)
+        if not html:
+            break
+        rl = (extract_state(html) or {}).get("userReviewListing") or {}
+        for r in ((rl.get("userReviewList") or {}).get("Reviews") or []):
+            params = {}
+            for q in r.get("QuesAns") or []:
+                h = (q.get("Heading") or "").strip()
+                if h and q.get("QuestionType") in (1, 2, 6):
+                    params[h] = q.get("AnswerText") or q.get("Answer")
+            rating = (r.get("RatingInfo") or {}).get("UserRating")
+            text = clean_text(r.get("Description"))
+            tips = clean_text(r.get("TipsAdvices"))
+            out.append({
+                "id": r.get("Id"), "title": clean_text(r.get("Title")),
+                "text": (text + (f"\nTips: {tips}" if tips else ""))[:1500],
+                "rating": rating, "params": params,
+                "date": r.get("EntryDate"), "kind": "critical" if rating and rating <= 2 else "general",
+                "version": (r.get("VehicleInfo") or {}).get("VersionName"),
+                "mileage": positive(num(r.get("Mileage"))), "city": r.get("CityName") or None,
+            })
+    return out
+
+
+def merge_reviews(a: list[dict], b: list[dict], cap: int = 40) -> list[dict]:
+    seen, out = set(), []
+    for r in a + b:
+        if r.get("id") in seen or not r.get("text"):
+            continue
+        seen.add(r.get("id"))
+        out.append(r)
+    critical = [r for r in out if r["kind"] == "critical"]
+    rest = [r for r in out if r["kind"] != "critical"]
+    return (critical[: cap // 4] + rest)[:cap]  # keep some critical voices even when capping
+
+
+def load_articles() -> dict[str, list[dict]]:
+    """Expert articles (long-term reports, first drives) from the stage-2 crawl, grouped by model id."""
+    path = DATA / "urls_stage2.json"
+    if not path.exists():
+        return {}
+    current = {u.split("carwale.com/")[1].rstrip("/") for u in json.loads((DATA / "urls_models.json").read_text(encoding="utf-8"))}
+    by_model: dict[str, list[dict]] = {}
+    for url in json.loads(path.read_text(encoding="utf-8")):
+        html = read_cached(url)
+        ed = (extract_state(html) or {}).get("editorialDetails") if html else None
+        if not ed or not ed.get("pageList"):
+            continue
+        mid = f"{ed.get('makeMaskingName')}/{ed.get('modelMaskingName')}"
+        older = None
+        if f"{ed.get('makeMaskingName')}-cars/{ed.get('modelMaskingName')}" not in current:
+            # article about an earlier generation, listed on the current model's page: attach to that model, labelled
+            m = re.search(r"carwale\.com/([a-z0-9-]+)-cars/([a-z0-9-]+)/", url)
+            if not m:
+                continue
+            mid, older = f"{m.group(1)}/{m.group(2)}", clean_text(ed.get("modelName")) or "earlier generation"
+        pages = [{"title": clean_text(p.get("pageName")), "text": clean_text(p.get("content"))}
+                 for p in ed["pageList"] if p.get("content")]
+        by_model.setdefault(mid, []).append({
+            "title": clean_text(ed.get("title")), "url": url, "date": ed.get("publishedDate"),
+            "author": ed.get("authorName"), "pages": pages, "older_generation": older,
+        })
+    return by_model
+
+
 def main() -> None:
     model_urls = json.loads((DATA / "urls_models.json").read_text(encoding="utf-8"))
     models, variants, errors = [], [], []
+    articles = load_articles()
     for url in model_urls:
         html = read_cached(url)
         if not html:
@@ -422,12 +513,15 @@ def main() -> None:
             top_trim = top_trim or (model["trims"][-1] if model["trims"] else None)
             # every cached trim page of this model: merge version specs, keep the richest feature tree
             ordered = ([top_trim] if top_trim else []) + [t for t in reversed(model["trims"]) if t is not top_trim]
+            trim_info: dict[str, dict] = {}
             for t in ordered:
                 th = read_cached(t["url"])
                 tp = (extract_state(th) or {}).get("trimPage") if th else None
                 if not tp:
                     continue
                 items, tr, faqs_t, ver = parse_trim(tp)
+                trim_info[t["slug"]] = {"name": t["name"], "url": t["url"], "version": ver, "groups": tr,
+                                        **trim_highlights(tp)}
                 for vid, its in items.items():
                     trim_items.setdefault(vid, its)
                 if len(tr) > len(tree):
@@ -435,7 +529,14 @@ def main() -> None:
                 if not trim_faqs:
                     trim_faqs = faqs_t
             model["faqs"].extend(trim_faqs)
+            model["trim_features"] = trim_info
             mvars = [build_variant(b, trim_items.get(b["version_id"]), model) for b in base_vars]
+            for v in mvars:  # each variant gets its own trim's full-feature-tree tags (connected car, AEB, OTA...)
+                ti = trim_info.get(v.get("trim_slug"))
+                if ti and ti["groups"]:
+                    v["feature_tags"] = sorted(set(v["feature_tags"]) | set(tree_tags(ti["groups"])))
+            model["owner_reviews"] = merge_reviews(model["owner_reviews"], review_page_reviews(url))
+            model["expert_articles"] = articles.get(model["id"], [])
             models.append(finalize_model(model, mvars, tree, tree_version))
             variants.extend(mvars)
         except Exception as e:  # keep going; report at the end
@@ -450,6 +551,9 @@ def main() -> None:
 
 
 def report(models: list[dict], variants: list[dict]) -> None:
+    L = [m for m in models if m["status"] == "launched"]
+    print(f"trim feature trees: {sum(len(m.get('trim_features') or {}) for m in L)} trims across {len(L)} launched models | "
+          f"owner reviews: {sum(len(m['owner_reviews']) for m in L)} | expert articles: {sum(len(m.get('expert_articles') or []) for m in L)}")
     print("models by status:", dict(Counter(m["status"] for m in models)))
     print("models by body type:", dict(Counter(m.get("body_type") for m in models)))
     launched = {m["id"] for m in models if m["status"] == "launched"}

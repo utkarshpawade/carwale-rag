@@ -29,7 +29,9 @@ CONTEXT hybrid search + "only 7 seaters" -> recommend; filter_mode refine; seats
 "best mileage petrol automatic cars under 10 lakh" -> recommend; fuel_types [Petrol], transmission Automatic, price_max 1000000; sort_by mileage
 "creta vs seltos diesel automatic" -> compare; cars Creta + Seltos with fuel_hint Diesel, transmission_hint Automatic
 "brezza ka mileage kitna hai" -> spec; cars [Brezza]; aspects [mileage]
-"who won the cricket match" -> out_of_scope"""
+"electric SUVs with more than 400 km range" -> recommend; fuel_types [Electric], body_types [SUV]; sort_by range
+"how was the service experience in CarWale's long term test of the Creta?" -> service; cars [Creta] (anything about a car, its reviews, tests or ownership is in scope)
+"who won the cricket match" -> out_of_scope (only non-car topics are out of scope)"""
 
 
 ANSWER_SYSTEM = """You are CarWale Assistant, a friendly expert car advisor for Indian buyers.

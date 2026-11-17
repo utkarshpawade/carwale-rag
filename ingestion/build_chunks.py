@@ -42,17 +42,24 @@ def split_text(text: str, limit: int = MAX_CHARS) -> list[str]:
     text = text.strip()
     if len(text) <= limit:
         return [text] if text else []
-    parts, cur = [], ""
-    for unit in re.split(r"(?<=[.!?])\s+|\n+", text):
-        unit = unit.strip()
-        if not unit:
+    units: list[str] = []
+    for line in text.split("\n"):  # keep line structure (feature groups, bullets); split long lines by clause
+        line = line.strip()
+        if not line:
             continue
-        if len(cur) + len(unit) + 1 > limit and cur:
-            parts.append(cur.strip())
+        if len(line) <= limit:
+            units.append(line)
+        else:
+            for s in re.split(r"(?<=[.!?;])\s+", line):
+                units += [s[i:i + limit] for i in range(0, len(s), limit)] if s else []
+    parts, cur = [], ""
+    for u in units:
+        if cur and len(cur) + len(u) + 1 > limit:
+            parts.append(cur)
             cur = ""
-        cur += unit + " "
-    if cur.strip():
-        parts.append(cur.strip())
+        cur = f"{cur}\n{u}" if cur else u
+    if cur:
+        parts.append(cur)
     return parts
 
 
@@ -155,8 +162,26 @@ def model_chunks(ch: Chunker, m: dict, vars_: list[dict]) -> None:
             lines.append(f"- {v['name']} ({inr(v.get('price'))}): {', '.join(b for b in spec_bits if b)}")
         common = set.intersection(*(set(v["feature_tags"]) for v in tv)) if tv else set()
         feat = ", ".join(sorted(common)).replace("_", " ")
-        body = "\n".join(lines) + (f"\nKey features in this trim: {feat}." if feat else "")
+        ti = (m.get("trim_features") or {}).get(tv[0].get("trim_slug")) or {}
+        extra = []
+        if ti.get("added"):
+            extra.append(f"What {trim} adds over {ti.get('lower_trim') or 'the trim below'}: {', '.join(ti['added'])}.")
+        if ti.get("next_adds"):
+            extra.append(f"Upgrading to {ti.get('upper_trim') or 'the next trim'} adds: {', '.join(ti['next_adds'])}.")
+        if ti.get("segment_best"):
+            extra.append(f"Segment-best in this trim: {', '.join(ti['segment_best'])}.")
+        body = "\n".join(lines) + (f"\nKey features in this trim: {feat}." if feat else "") + \
+            ("\n" + "\n".join(extra) if extra else "")
         ch.add(m, "trim", f"{trim} trim", body, url=tv[0].get("url"))
+        groups = ti.get("groups") or {}
+        if groups and ti.get("version") != (m.get("top_variant_features") or {}).get("version"):
+            feats = []
+            for g, items in groups.items():
+                yes_items = [i["name"] + ("" if i["value"] == "Yes" else f": {i['value']}") for i in items if i["value"] != "No"]
+                if yes_items and not g.lower().startswith("specification"):
+                    feats.append(f"{g.split('>')[-1].strip()}: {'; '.join(yes_items)}")
+            if feats:
+                ch.add(m, "trim_features", f"{trim} trim features ({ti.get('version')})", "\n".join(feats), url=ti.get("url"))
 
     # 4. pros/cons + expert opinion + expert review ---------------------------------------
     if m.get("pros") or m.get("cons") or m.get("verdict"):
@@ -168,6 +193,12 @@ def model_chunks(ch: Chunker, m: dict, vars_: list[dict]) -> None:
             ch.add(m, "expert_opinion", f"Expert opinion: {area} ({p['title']})", p["text"])
     for p in m.get("expert_review") or []:
         ch.add(m, "expert_review", f"Expert review: {p['title']}", p["text"])
+    for a in m.get("expert_articles") or []:  # long-term reports, first drives, service experiences
+        date = ", ".join((a.get("date") or "").split(",")[:2]).strip()
+        gen = f" [about the earlier generation: {a['older_generation']}]" if a.get("older_generation") else ""
+        for p in a["pages"]:
+            sub = f" — {p['title']}" if p["title"] and p["title"].lower() not in a["title"].lower() else ""
+            ch.add(m, "expert_article", f"CarWale article: {a['title']}{sub} ({date}){gen}", p["text"], url=a["url"])
 
     # 5. mileage ---------------------------------------------------------------------------
     rows = []
@@ -243,7 +274,12 @@ def model_chunks(ch: Chunker, m: dict, vars_: list[dict]) -> None:
     app = [i["name"] for g, items in tree.items() for i in items if "service" in i["name"].lower() and i["value"] != "No"]
     if app:
         svc.append(f"Service-related features: {', '.join(app)}.")
-    svc.append("CarWale does not publish scheduled service costs or maintenance schedules for this model; "
+    reports = [a["title"] for a in m.get("expert_articles") or []
+               if re.search(r"service|long.?term|ownership|maintenance|km report", a["title"], re.I)]
+    if reports:
+        svc.append(f"CarWale long-term ownership reports for this model: {'; '.join(reports[:5])}. "
+                   "These describe real service visits and running experience.")
+    svc.append("CarWale does not publish a scheduled service-cost table for this model; "
                "check with an authorised dealer for exact service costs.")
     ch.add(m, "service", "Service, warranty and ownership", " ".join(svc))
 
@@ -262,7 +298,10 @@ def model_chunks(ch: Chunker, m: dict, vars_: list[dict]) -> None:
         ch.add(m, "owner_reviews", "Owner review summary", body)
     for r in m.get("owner_reviews") or []:
         params = ", ".join(f"{k}: {v}" for k, v in r["params"].items() if v not in (None, ""))
-        body = f"{'Critical owner review' if r['kind'] == 'critical' else 'Owner review'} ({r.get('rating') or 'n/a'}/5, {r.get('date') or ''}): {r['title']}\n{r['text']}\nRatings: {params}"
+        meta = ", ".join(x for x in (r.get("version"), f"reports {r['mileage']:g} kmpl" if r.get("mileage") else None,
+                                     r.get("city")) if x)
+        body = (f"{'Critical owner review' if r['kind'] == 'critical' else 'Owner review'} ({r.get('rating') or 'n/a'}/5, "
+                f"{r.get('date') or ''}{'; ' + meta if meta else ''}): {r['title']}\n{r['text']}\nRatings: {params}")
         ch.add(m, "owner_reviews", "Owner review", body[: MAX_CHARS])
     if m.get("latest_updates"):
         ch.add(m, "news", "Latest updates", "\n".join(f"- {u['date']}: {u['title']}" for u in m["latest_updates"]))

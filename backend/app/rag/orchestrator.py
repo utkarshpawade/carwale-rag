@@ -23,30 +23,37 @@ from . import car_search, specs
 from .context import build_context
 from .entities import CarResolver, is_generic, norm
 from .followups import suggest
-from .hybrid_search import hybrid_search
-from .schemas import PLAN_SCHEMA, Filters, QueryPlan, empty_filters, simple_plan
+from .hybrid_search import hybrid_search, pinned_chunks
+from .schemas import PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v6"  # bump when prompts / ranking change
+CACHE_VERSION = "v7"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}
 INTENT_SECTIONS = {
     "spec": ["specs", "mileage", "overview", "faq", "trim", "features"],
     "price": ["variants", "city_prices", "faq", "overview", "trim"],
-    "feature_check": ["features", "trim", "faq", "safety"],
+    "feature_check": ["features", "trim", "trim_features", "faq", "safety"],
     "safety": ["safety", "expert_opinion", "faq", "overview"],
-    "service": ["service", "owner_reviews", "faq", "pros_cons"],
-    "review": ["pros_cons", "expert_opinion", "expert_review", "owner_reviews", "overview"],
-    "variant_advice": ["trim", "variants", "pros_cons", "features"],
+    "service": ["service", "expert_article", "owner_reviews", "faq", "pros_cons"],
+    "review": ["pros_cons", "expert_opinion", "expert_review", "expert_article", "owner_reviews", "overview"],
+    "variant_advice": ["trim", "trim_features", "variants", "pros_cons", "features"],
     "compare": ["pros_cons", "expert_opinion", "overview", "mileage", "safety"],
 }
 DEFAULT_ASPECTS = {"spec": {"specs"}, "price": {"price", "variants"}, "feature_check": {"features", "variants"},
                    "safety": {"safety"}, "service": {"service", "reviews"}, "review": {"reviews"},
                    "variant_advice": {"variants", "features", "price"}}
-ASPECT_SECTIONS = {"mileage": ["mileage"], "safety": ["safety"], "service": ["service"], "features": ["features"],
+ASPECT_SECTIONS = {"mileage": ["mileage", "expert_article", "owner_reviews"], "safety": ["safety"],
+                   "service": ["service", "expert_article"], "features": ["features", "trim_features"],
                    "reviews": ["owner_reviews", "pros_cons"], "on_road_price": ["city_prices"],
                    "price": ["variants", "city_prices"], "variants": ["trim", "variants"], "dimensions": ["specs"],
                    "performance": ["specs", "expert_opinion"], "comfort": ["expert_opinion", "features"]}
+
+
+# the dedicated summary chunk always included for an aspect / intent (fetched directly, not ranked)
+ASPECT_PIN = {"mileage": "mileage", "safety": "safety", "service": "service", "on_road_price": "city_prices",
+              "dimensions": "specs", "variants": "variants"}
+INTENT_PIN = {"safety": "safety", "service": "service", "price": "variants", "variant_advice": "variants"}
 
 
 @dataclass
@@ -98,6 +105,36 @@ class Pipeline:
         ctx = "CONTEXT\n" + ("\n".join(lines) if lines else "(new conversation)")
         return [{"role": "system", "content": PLANNER_SYSTEM},
                 {"role": "user", "content": f"{ctx}\n\nLATEST USER MESSAGE: {message}"}]
+
+    # ------------------------------------------------------------------------------------------ backstops
+    FUEL_WORDS = {"electric": "Electric", "ev": "Electric", "evs": "Electric", "diesel": "Diesel", "petrol": "Petrol",
+                  "cng": "CNG", "hybrid": "Hybrid", "hybrids": "Hybrid"}
+
+    def _backstops(self, plan: QueryPlan, message: str) -> list[str]:
+        """Deterministic guards for the few plan mistakes the eval exposed (LLM output is still the primary plan)."""
+        notes = []
+        found = self.resolver.find_in_text(message)
+        low = message.lower()
+        if plan.intent in ("out_of_scope", "chitchat") and found and not SMALLTALK.match(message):
+            plan.intent = ("service" if re.search(r"servic|mainten|warranty|ownership cost", low) else
+                           "spec" if re.search(r"mileage|range|boot|engine|power|spec|dimension", low) else "review")
+            plan.cars = [CarRef(mention=self.resolver.name(m), variant_hint=None, fuel_hint=None, transmission_hint=None)
+                         for m in found]
+            notes.append(f"Backstop: message names {', '.join(self.resolver.name(m) for m in found)}, so it is in scope.")
+        elif plan.intent in CAR_INTENTS and not plan.cars and plan.refers_to == "none" and found:
+            plan.cars = [CarRef(mention=self.resolver.name(m), variant_hint=None, fuel_hint=None, transmission_hint=None)
+                         for m in found]
+            notes.append("Backstop: car names taken from the message text.")
+        if plan.intent == "recommend" and not plan.cars and not plan.filters.fuel_types and not plan.filters.hybrid_types:
+            fuels = sorted({v for k, v in self.FUEL_WORDS.items() if k in norm(message).split()})
+            if fuels:
+                plan.filters.fuel_types = fuels
+                if "Hybrid" in fuels:
+                    plan.filters.hybrid_types = ["strong", "mild"]
+                if fuels == ["Electric"] and plan.sort_by == "relevance" and "range" in low:
+                    plan.sort_by = "range"
+                notes.append(f"Backstop: fuel filter {fuels} taken from the message text.")
+        return notes
 
     # ------------------------------------------------------------------------------------------ resolve
     def _targets(self, plan: QueryPlan, st: ConvState) -> tuple[list[str], list[dict], list[str], list[str]]:
@@ -184,9 +221,11 @@ class Pipeline:
                     yield Event("status", {"text": f"Groq free-tier limit reached — retrying in {wait:.0f}s…"})
                     await asyncio.sleep(wait)
         timer.mark("plan")
+        backstops = self._backstops(plan, message)
 
         # ---- 2. resolve
         target_ids, resolved, unresolved, notes = self._targets(plan, st)
+        notes = backstops + notes
         trace: dict[str, Any] = {
             "rewritten_query": plan.standalone_query, "intent": plan.intent, "plan": plan.model_dump(),
             "resolved_cars": resolved, "unresolved": unresolved, "notes": list(notes),
@@ -282,11 +321,28 @@ class Pipeline:
                 rivals += [self.resolver.name(x) for x in ((m.get("data") or {}).get("similar") or [])[:2]]
             if compare and all_facts:
                 blocks.append("Comparison:\n" + specs.compare_table(names, all_facts))
-            sections = list(dict.fromkeys(INTENT_SECTIONS.get(plan.intent, []) +
-                                          [s for a in aspects for s in ASPECT_SECTIONS.get(a, [])]))
-            chunks = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=target_ids,
-                                         sections=sections or None, k=8 if compare else 6,
-                                         per_model_cap=3 if compare else None)
+            # two-tier retrieval: core sections for this intent get most slots; aspect extras (long-term
+            # reports, owner reviews) get the rest, so plentiful review text cannot crowd out the core facts
+            primary = list(dict.fromkeys(INTENT_SECTIONS.get(plan.intent, [])))
+            extra = [s for s in dict.fromkeys(s for a in aspects for s in ASPECT_SECTIONS.get(a, [])) if s not in primary]
+            k_main, k_extra = (6, 2) if compare else (4, 2)
+            cap = 3 if compare else None
+            if primary:
+                chunks = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=target_ids,
+                                             sections=primary, k=k_main if extra else k_main + k_extra, per_model_cap=cap)
+                if extra:
+                    more = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=target_ids,
+                                               sections=extra, k=k_extra)
+                    have = {c["id"] for c in chunks}
+                    chunks += [c for c in more if c["id"] not in have]
+            else:
+                chunks = await hybrid_search(qvec, plan.standalone_query, plan.keywords, model_ids=target_ids,
+                                             sections=extra or None, k=k_main + k_extra, per_model_cap=cap)
+            pins = list(dict.fromkeys([ASPECT_PIN[a] for a in aspects if a in ASPECT_PIN] +
+                                      ([INTENT_PIN[plan.intent]] if plan.intent in INTENT_PIN else [])))[:2]
+            pinned = await pinned_chunks(target_ids[:3], pins)
+            pinned_ids = {c["id"] for c in pinned}
+            chunks = pinned + [c for c in chunks if c["id"] not in pinned_ids]
             trace["route"] = "compare" if compare else "car_details"
             trace["aspects"] = sorted(aspects)
             if not set(target_ids) <= set(st.active_cars):
