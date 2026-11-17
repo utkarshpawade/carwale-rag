@@ -256,6 +256,43 @@ def feature_availability(name: str, vs: list[dict], tags: list[str]) -> str:
     return "\n".join(lines)
 
 
+TRIM_STOP = {"ex", "s", "e", "o", "g", "v", "x", "base", "top", "plus", "option", "standard"}
+
+
+def mentioned_trims(text: str, vs: list[dict], hints: list[str] | None = None) -> list[str]:
+    """Trim names of this model that the user named (longest first, so 'HTK Plus (O)' beats 'HTK Plus')."""
+    names = sorted({v.get("trim") for v in vs if v.get("trim")}, key=lambda t: len(norm(t)), reverse=True)
+    low, found = f" {norm(text)} ", []
+    hint_norms = {norm(h) for h in (hints or []) if h}
+    for t in names:
+        nt = norm(t)
+        if not nt or (nt in TRIM_STOP and nt not in hint_norms):
+            continue
+        pos = low.find(f" {nt} ")
+        if pos >= 0 or nt in hint_norms:
+            found.append((pos if pos >= 0 else 10**6, t))
+            if pos >= 0:
+                low = low[:pos] + " " * (len(nt) + 2) + low[pos + len(nt) + 2:]
+    return [t for _, t in sorted(found)]
+
+
+def trim_comparison(name: str, vs: list[dict], a: str, b: str) -> str:
+    trims = _trims(vs)
+    A, B = trims.get(a), trims.get(b)
+    if not A or not B:
+        return ""
+    lab = lambda tags: ", ".join(sorted(TAG_LABELS.get(t, t.replace("_", " ")) for t in tags)) or "nothing in the tracked feature list"  # noqa: E731
+    pr = lambda d: price_range(min(v["price"] for v in d["variants"] if v.get("price")),  # noqa: E731
+                               max(v["price"] for v in d["variants"] if v.get("price"))) if any(v.get("price") for v in d["variants"]) else "n/a"
+    return "\n".join([
+        f"Trim comparison for {name}: {a} vs {b} (feature tags computed from CarWale trim data; authoritative):",
+        f"- Prices: {a} {pr(A)}; {b} {pr(B)}",
+        f"- {a} has but {b} lacks: {lab(A['tags'] - B['tags'])}",
+        f"- {b} has but {a} lacks: {lab(B['tags'] - A['tags'])}",
+        f"- Both have: {lab(A['tags'] & B['tags'])}",
+    ])
+
+
 def trim_feature_matrix(name: str, vs: list[dict], per_trim: int = 9) -> str:
     trims = _trims(vs)
     lines = [f"Key features of {name} by trim (cheapest to costliest):"]

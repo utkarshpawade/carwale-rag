@@ -23,7 +23,7 @@ from . import car_search, specs
 from .context import build_context
 from .entities import CarResolver, is_generic, norm
 from .followups import suggest
-from .hybrid_search import hybrid_search, pinned_chunks
+from .hybrid_search import hybrid_search, pinned_chunks, trim_chunks
 from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
 CACHE_VERSION = "v8"  # bump when prompts / ranking change
@@ -240,6 +240,9 @@ class Pipeline:
         # ---- 2. resolve
         target_ids, resolved, unresolved, notes = self._targets(plan, st)
         notes = backstops + notes
+        if plan.intent == "compare" and len(target_ids) == 1:
+            plan.intent = "variant_advice"  # "HTX vs HTK Plus": both names are one model, so compare its trims
+            notes.append("Both names resolve to one model, so its trims are compared.")
         trace: dict[str, Any] = {
             "rewritten_query": plan.standalone_query, "intent": plan.intent, "plan": plan.model_dump(),
             "resolved_cars": resolved, "unresolved": unresolved, "notes": list(notes),
@@ -315,13 +318,21 @@ class Pipeline:
             compare = plan.intent == "compare" or len(target_ids) > 1
             hints = {self.resolver.resolve(c.mention)[0].model_id: c for c in plan.cars if self.resolver.resolve(c.mention)}
             all_facts, names = [], []
+            named_trims: dict[str, list[str]] = {}
             for mid in target_ids:
                 m = models.get(mid)
                 if not m:
                     continue
                 h = hints.get(mid)
-                vs, vnotes = specs.filter_variants(variants.get(mid, []), h.fuel_hint if h else None,
-                                                   h.transmission_hint if h else None, h.variant_hint if h else None)
+                all_vs = variants.get(mid, [])
+                named = specs.mentioned_trims(" ".join([message, plan.standalone_query]), all_vs,
+                                              [c.variant_hint for c in plan.cars if c.variant_hint])
+                named_trims[mid] = named
+                if len(named) >= 2:  # trim vs trim of one model: keep both trims' variants
+                    vs, vnotes = [v for v in all_vs if v.get("trim") in named], []
+                else:
+                    vs, vnotes = specs.filter_variants(all_vs, h.fuel_hint if h else None,
+                                                       h.transmission_hint if h else None, h.variant_hint if h else None)
                 fs = specs.facts(m, vs, aspects, plan.city or st.prefs.get("city"), compare=compare)
                 if vnotes:
                     fs["Note"] = "; ".join(vnotes)
@@ -330,6 +341,8 @@ class Pipeline:
                 cards.append(specs.card(m))
                 if not compare:
                     blocks.append(specs.facts_block(m["full_name"], m["url"], fs))
+                    if len(named) >= 2:
+                        blocks.append(specs.trim_comparison(m["full_name"], all_vs, named[0], named[1]))
                     wanted = list(dict.fromkeys(plan.filters.feature_tags + specs.detect_features(
                         " ".join([message, plan.standalone_query] + plan.keywords))))
                     if wanted and plan.intent in ("feature_check", "variant_advice", "spec", "price"):
@@ -361,6 +374,9 @@ class Pipeline:
             pins = list(dict.fromkeys([ASPECT_PIN[a] for a in aspects if a in ASPECT_PIN] +
                                       ([INTENT_PIN[plan.intent]] if plan.intent in INTENT_PIN else [])))[:2]
             pinned = await pinned_chunks(target_ids[:3], pins)
+            for mid, named in named_trims.items():  # trims the user named: their own chunks incl. "adds over" diff
+                if named:
+                    pinned = await trim_chunks(mid, named[:3]) + pinned
             pinned_ids = {c["id"] for c in pinned}
             chunks = pinned + [c for c in chunks if c["id"] not in pinned_ids]
             trace["route"] = "compare" if compare else "car_details"

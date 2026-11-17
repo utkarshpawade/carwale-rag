@@ -157,6 +157,18 @@ def test_feature_detection_and_availability():
     assert "available on B, C" in out and "cheapest: B1" in out and "not on A" in out
 
 
+def test_trim_detection_and_diff():
+    from app.rag.specs import mentioned_trims, trim_comparison
+    vs = [{"name": "HTK Plus P", "trim": "HTK Plus", "price": 928000, "feature_tags": ["sunroof", "wireless_charger"]},
+          {"name": "HTK Plus (O) P", "trim": "HTK Plus (O)", "price": 976000, "feature_tags": ["sunroof"]},
+          {"name": "HTX P", "trim": "HTX", "price": 1160000, "feature_tags": ["sunroof", "wireless_charger", "ventilated_seats"]},
+          {"name": "EX P", "trim": "EX", "price": 900000, "feature_tags": []}]
+    assert mentioned_trims("What does the HTX add over the HTK Plus? prices ex-showroom", vs) == ["HTX", "HTK Plus"]
+    assert mentioned_trims("htk plus (o) vs htx", vs) == ["HTK Plus (O)", "HTX"]
+    out = trim_comparison("Sonet", vs, "HTX", "HTK Plus")
+    assert "HTX has but HTK Plus lacks: ventilated seats" in out and "HTK Plus has but HTX lacks: nothing" in out
+
+
 def test_split_text_keeps_lines_and_limit():
     from ingestion.build_chunks import split_text
     text = "\n".join(f"Group {i}: " + "; ".join(f"feature {i}-{j}" for j in range(40)) for i in range(6))

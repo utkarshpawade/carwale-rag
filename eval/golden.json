@@ -24,7 +24,9 @@
     {"q": "Which Creta variants get ventilated seats?", "intent": ["feature_check"], "targets": ["hyundai/creta"], "sections_any": ["trim", "trim_features", "features"]},
     {"q": "How was the service experience in CarWale's long term test of the Creta?", "intent": ["service", "review"], "targets": ["hyundai/creta"], "sections_any": ["expert_article", "service"]},
     {"q": "What problems do owners report with the Tata Nexon?", "intent": ["review"], "targets": ["tata/nexon"], "sections_any": ["owner_reviews"]},
-    {"q": "real world mileage of creta diesel", "intent": ["spec"], "targets": ["hyundai/creta"], "sections_any": ["mileage", "owner_reviews", "expert_article"]}
+    {"q": "real world mileage of creta diesel", "intent": ["spec"], "targets": ["hyundai/creta"], "sections_any": ["mileage", "owner_reviews", "expert_article"]},
+    {"q": "What does the Kia Sonet HTX add over the HTK Plus?", "intent": ["variant_advice", "feature_check"], "targets": ["kia/sonet"], "sections_any": ["trim"]},
+    {"q": "Which Kia Sonet variants get ventilated seats?", "intent": ["feature_check", "variant_advice"], "targets": ["kia/sonet"], "sections_any": ["trim", "trim_features", "features"]}
   ],
   "multi_turn": [
     {"name": "hybrid shopping", "turns": [
