@@ -24,7 +24,7 @@ from .context import build_context
 from .entities import CarResolver, is_generic, norm
 from .followups import suggest
 from .hybrid_search import hybrid_search, pinned_chunks
-from .schemas import PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
+from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
 CACHE_VERSION = "v7"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
@@ -125,6 +125,17 @@ class Pipeline:
             plan.cars = [CarRef(mention=self.resolver.name(m), variant_hint=None, fuel_hint=None, transmission_hint=None)
                          for m in found]
             notes.append("Backstop: car names taken from the message text.")
+        f = plan.filters
+        has_filters = bool(f.price_max or f.price_min or f.body_types or f.fuel_types or f.hybrid_types or f.seats_min
+                           or f.transmission or f.feature_tags or f.ncap_min or f.brands)
+        if plan.intent in CAR_INTENTS - {"compare"} and not plan.cars and plan.refers_to == "none" and has_filters:
+            # "Safest SUVs under 15 lakh" labelled 'safety' with no car named: it is a search, keep the implied sort
+            implied = {"safety": "safety", "price": "price_asc", "spec": "relevance"}.get(plan.intent, "relevance")
+            if plan.sort_by == "relevance":
+                plan.sort_by = implied
+            notes.append(f"Backstop: '{plan.intent}' question with filters and no car named -> structured search.")
+            plan.intent = "recommend"
+            plan.filter_mode = plan.filter_mode if plan.filter_mode != "none" else "new"
         if plan.intent == "recommend" and not plan.cars and not plan.filters.fuel_types and not plan.filters.hybrid_types:
             fuels = sorted({v for k, v in self.FUEL_WORDS.items() if k in norm(message).split()})
             if fuels:
@@ -211,7 +222,10 @@ class Pipeline:
             for attempt in range(3):  # wait out short free-tier rate-limit windows instead of failing
                 try:
                     plan, planner_info = await self.llm.json("planner", self._planner_messages(message, history, st),
-                                                             QueryPlan, PLAN_SCHEMA, max_tokens=self.s.planner_max_tokens)
+                                                             QueryPlan, PLAN_SCHEMA, max_tokens=self.s.planner_max_tokens,
+                                                             example=PLAN_EXAMPLE)
+                    if not plan.standalone_query.strip():
+                        plan.standalone_query = message
                     break
                 except LLMUnavailable as e:
                     if e.auth or attempt == 2 or (e.retry_after or 0) > 30:

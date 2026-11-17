@@ -1,28 +1,24 @@
-"""QueryPlan: the validated JSON the LLM planner must return. The LLM never writes SQL - code executes this plan."""
+"""QueryPlan: the validated JSON the LLM planner must return. The LLM never writes SQL - code executes this plan.
+
+The model is deliberately *tolerant*: free-tier models omit keys, emit null for empty lists, vary enum casing
+("EV", "mpv", "AMT") or give budgets in lakh ("15"). Before-validators normalise all of that, so a slightly
+imperfect plan is repaired locally instead of failing (and costing a fallback call).
+"""
 from __future__ import annotations
 
 import copy
-from typing import Annotated, Literal
+import re
+from typing import Annotated, Literal, Optional
 
-from pydantic import AfterValidator, BaseModel
+from pydantic import BaseModel, BeforeValidator, Field
 
 Fuel = Literal["Petrol", "Diesel", "CNG", "Electric", "Hybrid"]
 Body = Literal["SUV", "MUV", "Hatchback", "Sedan", "Coupe", "Convertible", "Pickup", "Van", "Wagon"]
+Trans = Literal["Manual", "Automatic"]
+Hyb = Literal["mild", "strong", "plug-in"]
 Intent = Literal["recommend", "spec", "price", "feature_check", "compare", "safety", "service", "review",
                  "variant_advice", "general", "chitchat", "out_of_scope"]
 SortBy = Literal["relevance", "price_asc", "price_desc", "mileage", "range", "power", "safety", "boot_space", "rating"]
-
-# Some models emit null for "empty" fields even under a strict schema (Groq then rejects the output with
-# json_validate_failed). Accept null in the schema and normalise it here, so code always sees lists/defaults.
-FuelList = Annotated[list[Fuel] | None, AfterValidator(lambda v: [] if v is None else v)]
-HybridList = Annotated[list[Literal["mild", "strong", "plug-in"]] | None, AfterValidator(lambda v: [] if v is None else v)]
-BodyList = Annotated[list[Body] | None, AfterValidator(lambda v: [] if v is None else v)]
-StrList = Annotated[list[str] | None, AfterValidator(lambda v: [] if v is None else v)]
-IntList = Annotated[list[int] | None, AfterValidator(lambda v: [] if v is None else v)]
-RefersTo = Annotated[Literal["none", "focus", "all", "indices"] | None, AfterValidator(lambda v: v or "none")]
-FilterMode = Annotated[Literal["new", "refine", "none"] | None, AfterValidator(lambda v: v or "none")]
-Sort = Annotated[SortBy | None, AfterValidator(lambda v: v or "relevance")]
-Status = Annotated[Literal["launched", "upcoming"] | None, AfterValidator(lambda v: v or "launched")]
 
 FEATURE_TAGS = [
     "sunroof", "panoramic_sunroof", "ventilated_seats", "wireless_charger", "360_camera", "reverse_camera",
@@ -33,54 +29,152 @@ FEATURE_TAGS = [
     "touchscreen", "aeb", "lane_keep_assist", "voice_commands", "electric_parking_brake",
 ]
 
+FUEL_MAP = {"petrol": "Petrol", "gasoline": "Petrol", "diesel": "Diesel", "cng": "CNG", "electric": "Electric",
+            "ev": "Electric", "bev": "Electric", "hybrid": "Hybrid", "strong hybrid": "Hybrid", "mild hybrid": "Hybrid"}
+HYB_MAP = {"mild": "mild", "strong": "strong", "plug-in": "plug-in", "plugin": "plug-in", "plug in": "plug-in",
+           "phev": "plug-in", "self-charging": "strong", "full": "strong"}
+BODY_MAP = {**{b.lower(): b for b in ("SUV", "MUV", "Hatchback", "Sedan", "Coupe", "Convertible", "Pickup", "Van", "Wagon")},
+            "mpv": "MUV", "muv/mpv": "MUV", "compact suv": "SUV", "sub-compact suv": "SUV", "crossover": "SUV",
+            "hatch": "Hatchback", "pickup truck": "Pickup", "estate": "Wagon", "minivan": "Van"}
+TRANS_MAP = {"manual": "Manual", "mt": "Manual", "automatic": "Automatic", "auto": "Automatic", "amt": "Automatic",
+             "cvt": "Automatic", "dct": "Automatic", "at": "Automatic", "e-cvt": "Automatic", "torque converter": "Automatic"}
+INTENT_MAP = {**{i: i for i in Intent.__args__}, "recommendation": "recommend", "search": "recommend",
+              "comparison": "compare", "specs": "spec", "specification": "spec", "mileage": "spec",
+              "features": "feature_check", "feature": "feature_check", "variant": "variant_advice", "pricing": "price",
+              "reviews": "review", "maintenance": "service", "greeting": "chitchat", "off_topic": "out_of_scope"}
+SORT_MAP = {**{s: s for s in SortBy.__args__}, "cheapest": "price_asc", "price": "price_asc", "fuel_efficiency": "mileage",
+            "efficiency": "mileage", "performance": "power", "safest": "safety", "boot": "boot_space"}
+
+
+def _key(v) -> str:
+    return str(v).strip().lower().replace("_", " ") if v is not None else ""
+
+
+def _enum(mapping: dict, default=None):
+    def f(v):
+        if v is None or v == "":
+            return default
+        k = _key(v)
+        return mapping.get(k, mapping.get(k.replace(" ", "_"), mapping.get(str(v).strip(), default)))
+    return f
+
+
+def _enum_list(mapping: dict):
+    def f(v):
+        if v is None:
+            return []
+        out = []
+        for x in (v if isinstance(v, list) else [v]):
+            c = _enum(mapping)(x)
+            if c and c not in out:
+                out.append(c)
+        return out
+    return f
+
+
+def _str_list(v):
+    if v is None:
+        return []
+    return [str(x).strip() for x in (v if isinstance(v, list) else [v]) if str(x).strip()]
+
+
+def _tags(v):
+    return [t for t in (x.lower().replace(" ", "_").replace("-", "_") for x in _str_list(v)) if t in FEATURE_TAGS]
+
+
+def _int(v):
+    if v in (None, "", [], {}):
+        return None
+    try:
+        return int(float(str(v).replace(",", "")))
+    except ValueError:
+        return None
+
+
+def _float(v):
+    if v in (None, ""):
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _price(v):
+    """INR. Accepts 1500000, '15 lakh', '1.2 crore', or a bare 15 / '15' (read as lakh)."""
+    if v in (None, "", 0):
+        return None
+    if isinstance(v, str):
+        m = re.search(r"([\d.]+)\s*(crore|cr|lakh|lac|l)?", v.lower().replace(",", ""))
+        if not m:
+            return None
+        n = float(m.group(1))
+        unit = m.group(2) or ""
+        v = n * (1e7 if unit.startswith("c") else 1e5 if unit else 1)
+    v = float(v)
+    if 0 < v < 1000:  # "under 15" almost always means 15 lakh
+        v *= 1e5
+    return int(v) if v > 0 else None
+
+
+def _cars(v):
+    if v is None:
+        return []
+    out = []
+    for x in (v if isinstance(v, list) else [v]):
+        if isinstance(x, str) and x.strip():
+            out.append({"mention": x.strip()})
+        elif isinstance(x, dict) and (x.get("mention") or x.get("name") or x.get("model")):
+            out.append({**x, "mention": x.get("mention") or x.get("name") or x.get("model")})
+    return out
+
 
 class CarRef(BaseModel):
     mention: str
-    variant_hint: str | None
-    fuel_hint: Fuel | None
-    transmission_hint: Literal["Manual", "Automatic"] | None
+    variant_hint: Optional[str] = None
+    fuel_hint: Annotated[Optional[Fuel], BeforeValidator(_enum(FUEL_MAP))] = None
+    transmission_hint: Annotated[Optional[Trans], BeforeValidator(_enum(TRANS_MAP))] = None
 
 
 class Filters(BaseModel):
-    price_min: int | None
-    price_max: int | None
-    fuel_types: FuelList
-    hybrid_types: HybridList
-    body_types: BodyList
-    transmission: Literal["Manual", "Automatic"] | None
-    seats_min: int | None
-    brands: StrList
-    feature_tags: StrList
-    ncap_min: int | None
-    mileage_min: float | None
-    status: Status
+    price_min: Annotated[Optional[int], BeforeValidator(_price)] = None
+    price_max: Annotated[Optional[int], BeforeValidator(_price)] = None
+    fuel_types: Annotated[list[Fuel], BeforeValidator(_enum_list(FUEL_MAP))] = Field(default_factory=list)
+    hybrid_types: Annotated[list[Hyb], BeforeValidator(_enum_list(HYB_MAP))] = Field(default_factory=list)
+    body_types: Annotated[list[Body], BeforeValidator(_enum_list(BODY_MAP))] = Field(default_factory=list)
+    transmission: Annotated[Optional[Trans], BeforeValidator(_enum(TRANS_MAP))] = None
+    seats_min: Annotated[Optional[int], BeforeValidator(_int)] = None
+    brands: Annotated[list[str], BeforeValidator(_str_list)] = Field(default_factory=list)
+    feature_tags: Annotated[list[str], BeforeValidator(_tags)] = Field(default_factory=list)
+    ncap_min: Annotated[Optional[int], BeforeValidator(_int)] = None
+    mileage_min: Annotated[Optional[float], BeforeValidator(_float)] = None
+    status: Annotated[Literal["launched", "upcoming"], BeforeValidator(_enum({"launched": "launched", "upcoming": "upcoming"}, "launched"))] = "launched"
 
 
 class QueryPlan(BaseModel):
-    standalone_query: str
-    intent: Intent
-    cars: Annotated[list[CarRef] | None, AfterValidator(lambda v: [] if v is None else v)]
-    refers_to: RefersTo
-    active_indices: IntList
-    filters: Filters
-    filter_mode: FilterMode
-    prefer_tags: StrList
-    sort_by: Sort
-    aspects: StrList
-    keywords: StrList
-    city: str | None
-    clarify: str | None
+    standalone_query: Annotated[str, BeforeValidator(lambda v: "" if v is None else str(v))] = ""
+    intent: Annotated[Intent, BeforeValidator(_enum(INTENT_MAP, "general"))] = "general"
+    cars: Annotated[list[CarRef], BeforeValidator(_cars)] = Field(default_factory=list)
+    refers_to: Annotated[Literal["none", "focus", "all", "indices"],
+                         BeforeValidator(_enum({"none": "none", "focus": "focus", "all": "all", "indices": "indices"}, "none"))] = "none"
+    active_indices: Annotated[list[int], BeforeValidator(lambda v: [i for i in map(_int, v if isinstance(v, list) else [v]) if i] if v else [])] = Field(default_factory=list)
+    filters: Annotated[Filters, BeforeValidator(lambda v: v or {})] = Field(default_factory=Filters)
+    filter_mode: Annotated[Literal["new", "refine", "none"],
+                           BeforeValidator(_enum({"new": "new", "refine": "refine", "none": "none"}, "none"))] = "none"
+    prefer_tags: Annotated[list[str], BeforeValidator(_tags)] = Field(default_factory=list)
+    sort_by: Annotated[SortBy, BeforeValidator(_enum(SORT_MAP, "relevance"))] = "relevance"
+    aspects: Annotated[list[str], BeforeValidator(_str_list)] = Field(default_factory=list)
+    keywords: Annotated[list[str], BeforeValidator(_str_list)] = Field(default_factory=list)
+    city: Optional[str] = None
+    clarify: Optional[str] = None
 
 
 def empty_filters() -> Filters:
-    return Filters(price_min=None, price_max=None, fuel_types=[], hybrid_types=[], body_types=[], transmission=None,
-                   seats_min=None, brands=[], feature_tags=[], ncap_min=None, mileage_min=None, status="launched")
+    return Filters()
 
 
 def simple_plan(message: str, intent: str) -> QueryPlan:
-    return QueryPlan(standalone_query=message, intent=intent, cars=[], refers_to="none", active_indices=[],
-                     filters=empty_filters(), filter_mode="none", prefer_tags=[], sort_by="relevance", aspects=[],
-                     keywords=[], city=None, clarify=None)
+    return QueryPlan(standalone_query=message, intent=intent)
 
 
 def strict_json_schema(model: type[BaseModel]) -> dict:
@@ -105,3 +199,12 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
 
 
 PLAN_SCHEMA = strict_json_schema(QueryPlan)
+
+# One complete example output; used in JSON-object mode so every model sees the exact shape to produce.
+PLAN_EXAMPLE = (
+    '{"standalone_query":"Which hybrid SUVs under 20 lakh have the best mileage?","intent":"recommend","cars":[],'
+    '"refers_to":"none","active_indices":[],"filters":{"price_min":null,"price_max":2000000,"fuel_types":["Hybrid"],'
+    '"hybrid_types":["strong","mild"],"body_types":["SUV"],"transmission":null,"seats_min":null,"brands":[],'
+    '"feature_tags":[],"ncap_min":null,"mileage_min":null,"status":"launched"},"filter_mode":"new","prefer_tags":[],'
+    '"sort_by":"mileage","aspects":["mileage","price"],"keywords":["hybrid","SUV","mileage"],"city":null,"clarify":null}'
+)

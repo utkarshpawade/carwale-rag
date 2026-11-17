@@ -131,11 +131,16 @@ class LLMClient:
 
     # ---------------------------------------------------------------- structured output
     async def json(self, role: str, messages: list[dict], schema_model: type[T], json_schema: dict,
-                   max_tokens: int = 700, timeout: float = 8.0) -> tuple[T, CallInfo]:
-        """Strict json_schema where supported, else json_object + Pydantic validation (+1 repair retry)."""
+                   max_tokens: int = 700, timeout: float = 8.0, example: str | None = None) -> tuple[T, CallInfo]:
+        """Structured output validated locally by Pydantic (+1 repair retry).
+
+        With `example`, every model runs in JSON-object mode with a complete example to copy the shape from.
+        Groq's 'strict' json_schema only validates after generation on these models (no constrained decoding),
+        so it rejected near-valid plans (a missing key, a placeholder); the tolerant Pydantic model repairs those.
+        """
         info = CallInfo(role)
         t0 = time.time()
-        schema_txt = json.dumps(json_schema, separators=(",", ":"))
+        schema_txt = example or json.dumps(json_schema, separators=(",", ":"))
         need = _est_tokens(messages, schema_txt) + max_tokens
         models, wait = self._candidates(role, need, info)
         last_retry = wait
@@ -144,7 +149,12 @@ class LLMClient:
                 self._cool(model, 30)
                 info.attempts.append(f"{model}:forced_fail")
                 continue
-            if model in STRICT_SCHEMA_MODELS:
+            if example:
+                rf = {"type": "json_object"}
+                msgs = messages + [{"role": "system", "content":
+                                    "Output ONLY one JSON object with exactly the keys of this example (use null or [] "
+                                    "when not applicable; real values, no placeholders, no prose):\n" + example}]
+            elif model in STRICT_SCHEMA_MODELS:
                 rf = {"type": "json_schema", "json_schema": {"name": schema_model.__name__, "strict": True, "schema": json_schema}}
                 msgs = messages
             else:

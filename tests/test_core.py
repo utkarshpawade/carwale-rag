@@ -131,6 +131,21 @@ def test_plan_schema_is_strict():
     Filters.model_validate(empty_filters().model_dump())
 
 
+def test_plan_is_tolerant_of_imperfect_model_output():
+    from app.rag.schemas import QueryPlan
+    # missing keys (gpt-oss-20b), nulls, odd casing, lakh budgets, cars as plain strings
+    p = QueryPlan.model_validate({"standalone_query": "q", "intent": "Recommendation", "cars": ["Creta", {"name": "Seltos"}],
+                                  "filters": {"price_max": "15", "fuel_types": ["EV", "petrol", "rocket"], "body_types": "mpv",
+                                              "transmission": "AMT", "feature_tags": ["Sunroof", "wings"], "ncap_min": 5.0},
+                                  "sort_by": "cheapest", "active_indices": ["2"]})
+    assert p.intent == "recommend" and [c.mention for c in p.cars] == ["Creta", "Seltos"]
+    f = p.filters
+    assert f.price_max == 1_500_000 and f.fuel_types == ["Electric", "Petrol"] and f.body_types == ["MUV"]
+    assert f.transmission == "Automatic" and f.feature_tags == ["sunroof"] and f.ncap_min == 5 and f.status == "launched"
+    assert p.sort_by == "price_asc" and p.active_indices == [2] and p.refers_to == "none"
+    assert QueryPlan.model_validate({}).intent == "general"
+
+
 def test_split_text_keeps_lines_and_limit():
     from ingestion.build_chunks import split_text
     text = "\n".join(f"Group {i}: " + "; ".join(f"feature {i}-{j}" for j in range(40)) for i in range(6))

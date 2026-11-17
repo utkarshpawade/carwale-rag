@@ -7,7 +7,7 @@ conversation, so follow-ups such as *"which one has the best mileage?"*, *"what 
 
 - **Data:** 400 models (288 on sale, 112 upcoming), 2,283 variants, 912 trim feature trees, 4,458 owner reviews and 390 expert articles (incl. 54 long-term reports), giving 21,416 retrieval chunks crawled politely from carwale.com
 - **Stack:** FastAPI · Groq (gpt-oss-120b / gpt-oss-20b / Llama 3.x) · Postgres + pgvector (Neon) · fastembed (bge-small, ONNX) · React + Vite + Tailwind
-- **Live:** frontend `https://<your-app>.vercel.app` · API `https://<your-api>.onrender.com/docs`
+- **Live:** app **https://carwale-rag.vercel.app** · API **https://carwale-rag-api.onrender.com** ([health](https://carwale-rag-api.onrender.com/api/health), [docs](https://carwale-rag-api.onrender.com/docs)). The free Render instance sleeps when idle; the first request wakes it in about a minute.
 
 ---
 
