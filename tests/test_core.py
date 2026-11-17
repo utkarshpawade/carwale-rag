@@ -193,3 +193,10 @@ def test_split_text_keeps_lines_and_limit():
 def test_digest():
     d = Pipeline._digest("**Grand Vitara** is | great |", ["Maruti Suzuki Grand Vitara"])
     assert d.startswith("[cars: Maruti Suzuki Grand Vitara]") and "|" not in d.split("]", 1)[1]
+
+
+def test_crash_rating_distinguishes_not_tested_from_unlisted():
+    from app.rag.specs import crash_rating
+    assert crash_rating({"ncap_rating": 5, "ncap_agency": "Bharat NCAP"}, []) == "5-star (Bharat NCAP)"
+    assert crash_rating({}, [{"specs": {"NCAP Rating": "Not Tested"}}]).startswith("Not Tested")
+    assert crash_rating({}, [{"specs": {}}, {"specs": None}]) == "no crash-test rating listed on CarWale"

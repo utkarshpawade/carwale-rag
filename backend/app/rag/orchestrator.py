@@ -26,7 +26,7 @@ from .followups import suggest
 from .hybrid_search import hybrid_search, pinned_chunks, titled_chunks, trim_chunks
 from .schemas import PLAN_EXAMPLE, PLAN_SCHEMA, CarRef, Filters, QueryPlan, empty_filters, simple_plan
 
-CACHE_VERSION = "v9"  # bump when prompts / ranking change
+CACHE_VERSION = "v10"  # bump when prompts / ranking change
 SMALLTALK = re.compile(r"^\s*(hi+|hello+|hey+|hii+|namaste|hola|yo|good (morning|afternoon|evening)|thanks?( you| a lot)?|"
                        r"thank u|thx|ok(ay)?|cool|great|nice|bye|goodbye)\s*[!.?]*\s*$", re.I)
 CAR_INTENTS = {"spec", "price", "feature_check", "compare", "safety", "service", "review", "variant_advice"}

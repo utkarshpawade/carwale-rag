@@ -120,6 +120,16 @@ def powertrains(vs: list[dict]) -> list[dict]:
     return out
 
 
+def crash_rating(m: dict, vs: list[dict]) -> str:
+    """CarWale marks 125 unrated cars 'Not Tested' on their trim pages; ~50 others list nothing. Keep the two apart
+    so the model never turns 'no rating listed' into 'not crash-tested'."""
+    if m.get("ncap_rating"):
+        return f"{m['ncap_rating']}-star ({m.get('ncap_agency') or 'NCAP'})"
+    if any(str((v.get("specs") or {}).get("NCAP Rating", "")).strip().lower() == "not tested" for v in vs):
+        return "Not Tested (CarWale lists this car as not crash-tested)"
+    return "no crash-test rating listed on CarWale"
+
+
 def facts(m: dict, vs: list[dict], aspects: set[str], city: str | None = None, compare: bool = False) -> "OrderedDict[str, str]":
     """Ordered label -> value facts for one car, limited to the aspects asked about."""
     d = m.get("data") or {}
@@ -159,7 +169,7 @@ def facts(m: dict, vs: list[dict], aspects: set[str], city: str | None = None, c
         if top.get("fuel_tank_l"):
             f["Fuel tank"] = num(top.get("fuel_tank_l"), "litres")
     if every or aspects & {"safety"}:
-        f["Crash rating"] = f"{m['ncap_rating']}-star ({m.get('ncap_agency') or 'NCAP'})" if m.get("ncap_rating") else "not crash-tested / not listed"
+        f["Crash rating"] = crash_rating(m, vs)
         ab = sorted({v["airbags"] for v in vs if v.get("airbags")})
         f["Airbags"] = ", ".join(map(str, ab)) or "n/a"
         tags = set(m.get("feature_tags") or [])
